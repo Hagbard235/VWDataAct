@@ -43,7 +43,7 @@ class VWEUDataActTelemetry extends IPSModule
         }
 
         // Validate FilePath Property
-        $filePath = trim($this->ReadPropertyString('FilePath'));
+        $filePath = $this->ResolvePath(trim($this->ReadPropertyString('FilePath')));
         if (empty($filePath) || !file_exists($filePath)) {
             $this->SetStatus(201); // File or folder not found
             return;
@@ -53,6 +53,25 @@ class VWEUDataActTelemetry extends IPSModule
 
         // Execute initial update
         $this->UpdateData();
+    }
+
+    /**
+     * Resolve path relative to Symcon Kernel Dir if needed
+     */
+    private function ResolvePath(string $path): string
+    {
+        if (empty($path)) {
+            return '';
+        }
+        if (file_exists($path)) {
+            return $path;
+        }
+        // Try relative to Symcon Root/Kernel directory (e.g. user/myexport.zip)
+        $kernelPath = IPS_GetKernelDir() . ltrim($path, '/\\');
+        if (file_exists($kernelPath)) {
+            return $kernelPath;
+        }
+        return $path;
     }
 
     /**
@@ -213,10 +232,12 @@ class VWEUDataActTelemetry extends IPSModule
      */
     public function UpdateData()
     {
-        $filePath = trim($this->ReadPropertyString('FilePath'));
+        $rawPath = trim($this->ReadPropertyString('FilePath'));
+        $filePath = $this->ResolvePath($rawPath);
+
         if (empty($filePath) || !file_exists($filePath)) {
             $this->SetStatus(201);
-            $this->SendDebug('UpdateData', 'Dateipfad ungültig oder nicht vorhanden: ' . $filePath, 0);
+            $this->SendDebug('UpdateData', 'Dateipfad ungültig oder nicht vorhanden: ' . $rawPath, 0);
             return;
         }
 
