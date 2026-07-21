@@ -1,0 +1,82 @@
+{
+    "elements": [
+        {
+            "type": "ValidationTextBox",
+            "name": "FilePath",
+            "caption": "ZIP-Dateipfad oder Ordnerpfad zum Telemetrie-Export"
+        },
+        {
+            "type": "NumberSpinner",
+            "name": "PollInterval",
+            "caption": "Import Intervall (Minuten, 0 = Manuell)",
+            "minimum": 0,
+            "maximum": 1440,
+            "suffix": " min"
+        },
+        {
+            "type": "ExpansionPanel",
+            "caption": "Datenbereich Feature-Toggles",
+            "items": [
+                {
+                    "type": "CheckBox",
+                    "name": "EnableHVBattery",
+                    "caption": "Hochvolt-Akku & PV-Laden aktivieren"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "Enable12VBordnetz",
+                    "caption": "12V-Bordnetz & Akku-Diagnose aktivieren"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "EnableSecurity",
+                    "caption": "Sicherheit & Fahrzeugstatus aktivieren"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "EnableTyrePressure",
+                    "caption": "Reifendruck & Sensorik aktivieren"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "EnableClimatisation",
+                    "caption": "Klima, Komfort & Verbraucher aktivieren"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "EnableService",
+                    "caption": "Laufleistung, Wartung & Systemzustand aktivieren"
+                }
+            ]
+        }
+    ],
+    "actions": [
+        {
+            "type": "Button",
+            "caption": "Jetzt Importieren & Aktualisieren",
+            "onClick": "VWDA_UpdateData($id);"
+        },
+        {
+            "type": "Button",
+            "caption": "Visualisierung Neu Rendern",
+            "onClick": "VWDA_RenderTileVisualization($id);"
+        }
+    ],
+    "status": [
+        {
+            "code": 102,
+            "icon": "active",
+            "caption": "VW EU Data Act Telemetry Modul ist aktiv."
+        },
+        {
+            "code": 201,
+            "icon": "error",
+            "caption": "Dateipfad oder Ordner wurde nicht angegeben oder existiert nicht."
+        },
+        {
+            "code": 202,
+            "icon": "error",
+            "caption": "Fehler beim Auslesen oder Entpacken des Telemetrie-ZIPs."
+        }
+    ]
+}

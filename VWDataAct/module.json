@@ -1,0 +1,11 @@
+{
+    "id": "{c3fbf346-6002-438d-ae7c-4ade955f2624}",
+    "name": "VW EU Data Act Telemetry",
+    "type": 3,
+    "vendor": "Volkswagen",
+    "aliases": ["VW EU Data Act Telemetry", "VAG Telemetry", "Cupra Telemetry", "Seat Telemetry", "Audi Telemetry"],
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "prefix": "VWDA"
+}
