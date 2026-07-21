@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-class VWDataAct extends IPSModule
+class VWEUDataActTelemetry extends IPSModule
 {
     public function Create()
     {
