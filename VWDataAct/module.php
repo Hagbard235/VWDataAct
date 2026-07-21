@@ -92,8 +92,12 @@ class VWEUDataActTelemetry extends IPSModule
         }
 
         $cookieFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'vwda_cookie_' . $this->InstanceID . '.txt';
+        if (file_exists($cookieFile)) {
+            @unlink($cookieFile);
+        }
 
         // Step 1: Initiate Portal Auth Session
+        $this->SendDebug('DownloadAndImport', 'Schritt 1: Portal-Sitzung initiieren (https://eu-data-act.drivesomethinggreater.com)...', 0);
         $portalUrl = 'https://eu-data-act.drivesomethinggreater.com/';
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $portalUrl);
@@ -101,12 +105,14 @@ class VWEUDataActTelemetry extends IPSModule
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
         curl_setopt($ch, CURLOPT_COOKIEJAR, $cookieFile);
         curl_setopt($ch, CURLOPT_COOKIEFILE, $cookieFile);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         $html = curl_exec($ch);
         $effectiveUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
 
         // Step 2: Post Login Credentials if login form redirected
-        if (strpos($effectiveUrl, 'auth') !== false || strpos($effectiveUrl, 'identity') !== false || strpos((string)$html, 'login') !== false) {
+        $this->SendDebug('DownloadAndImport', 'Schritt 2: Authentifizierung an IPD/OIDC Portal: ' . $effectiveUrl, 0);
+        if (strpos($effectiveUrl, 'auth') !== false || strpos($effectiveUrl, 'identity') !== false || strpos((string)$html, 'login') !== false || strpos((string)$html, 'username') !== false) {
             preg_match('/action="([^"]+)"/', (string)$html, $matches);
             $loginUrl = isset($matches[1]) ? htmlspecialchars_decode($matches[1]) : $effectiveUrl;
 
@@ -118,52 +124,83 @@ class VWEUDataActTelemetry extends IPSModule
             ]));
             $loginResponse = curl_exec($ch);
             $loginEffUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+            $this->SendDebug('DownloadAndImport', 'Login-Antwort URL: ' . $loginEffUrl, 0);
 
-            if (strpos((string)$loginResponse, 'error') !== false && strpos((string)$loginEffUrl, 'login') !== false) {
+            if (strpos((string)$loginResponse, 'error') !== false && (strpos((string)$loginEffUrl, 'login') !== false || strpos((string)$loginEffUrl, 'auth') !== false)) {
                 $this->SetStatus(203);
-                $this->SendDebug('DownloadAndImport', 'Portal-Anmeldung fehlgeschlagen (Falsche E-Mail/Passwort).', 0);
+                $this->SendDebug('DownloadAndImport', 'Portal-Anmeldung fehlgeschlagen (Falsche E-Mail/Passwort oder MFA erforderlich).', 0);
                 curl_close($ch);
                 @unlink($cookieFile);
                 return false;
             }
         }
 
-        // Step 3: Fetch Export List
-        $apiUrl = 'https://eu-data-act.drivesomethinggreater.com/api/v1/exports';
-        if (!empty($vin)) {
-            $apiUrl .= '?vin=' . urlencode($vin);
-        }
-        curl_setopt($ch, CURLOPT_URL, $apiUrl);
-        curl_setopt($ch, CURLOPT_HTTPGET, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Accept: application/json',
-            'X-Requested-With: XMLHttpRequest'
-        ]);
-        $exportJson = curl_exec($ch);
+        // Step 3: Fetch Active Data Requests / Exports List
+        $this->SendDebug('DownloadAndImport', 'Schritt 3: Abrufen der Datenexport-Liste für VIN: ' . ($vin ?: 'Alle'), 0);
+        
+        $candidateEndpoints = [
+            'https://eu-data-act.drivesomethinggreater.com/api/data-requests',
+            'https://eu-data-act.drivesomethinggreater.com/api/v1/data-requests',
+            'https://eu-data-act.drivesomethinggreater.com/api/exports',
+            'https://eu-data-act.drivesomethinggreater.com/api/v1/exports'
+        ];
 
         $downloadUrl = '';
-        $exportData = json_decode((string)$exportJson, true);
-        if (is_array($exportData)) {
-            $exports = $exportData['exports'] ?? $exportData['data'] ?? $exportData;
-            if (is_array($exports) && !empty($exports)) {
-                foreach ($exports as $exp) {
-                    if (isset($exp['downloadUrl']) || isset($exp['url'])) {
-                        $downloadUrl = $exp['downloadUrl'] ?? $exp['url'];
-                        break;
+        $lastHttpCode = 0;
+
+        foreach ($candidateEndpoints as $endpoint) {
+            $url = $endpoint;
+            if (!empty($vin)) {
+                $url .= '?vin=' . urlencode($vin);
+            }
+
+            curl_setopt($ch, CURLOPT_URL, $url);
+            curl_setopt($ch, CURLOPT_HTTPGET, true);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                'Accept: application/json, text/plain, */*',
+                'X-Requested-With: XMLHttpRequest'
+            ]);
+            $response = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $lastHttpCode = $httpCode;
+
+            $this->SendDebug('DownloadAndImport', "Endpoint {$endpoint} => HTTP Code {$httpCode}", 0);
+
+            if ($httpCode === 200 && !empty($response)) {
+                $data = json_decode((string)$response, true);
+                if (is_array($data)) {
+                    $items = $data['data'] ?? $data['exports'] ?? $data['requests'] ?? $data;
+                    if (is_array($items)) {
+                        foreach ($items as $item) {
+                            if (is_array($item)) {
+                                if (isset($item['downloadUrl'])) {
+                                    $downloadUrl = $item['downloadUrl'];
+                                    break 2;
+                                } elseif (isset($item['url'])) {
+                                    $downloadUrl = $item['url'];
+                                    break 2;
+                                } elseif (isset($item['id'])) {
+                                    $downloadUrl = "https://eu-data-act.drivesomethinggreater.com/api/data-requests/" . $item['id'] . "/download";
+                                    break 2;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Fallback if portal direct endpoint
         if (empty($downloadUrl)) {
-            $downloadUrl = 'https://eu-data-act.drivesomethinggreater.com/api/v1/exports/latest/download';
-            if (!empty($vin)) {
-                $downloadUrl .= '?vin=' . urlencode($vin);
-            }
+            $this->SetStatus(202);
+            $this->SendDebug('DownloadAndImport', "FEHLER (HTTP {$lastHttpCode}): Es wurde kein aktiver Datenexport für den Account / VIN gefunden.", 0);
+            $this->SendDebug('DownloadAndImport', "HINWEIS: Du musst dich einmalig auf https://eu-data-act.drivesomethinggreater.com im Browser anmelden und unter 'Daten-Cluster' einen dauerhaften 15-Minuten Export für dein Fahrzeug aktivieren!", 0);
+            curl_close($ch);
+            @unlink($cookieFile);
+            return false;
         }
 
-        // Step 4: Download ZIP archive
+        // Step 4: Download ZIP Archive
+        $this->SendDebug('DownloadAndImport', 'Schritt 4: Lade Telemetrie-ZIP herunter von: ' . $downloadUrl, 0);
         $zipFilename = 'telemetry_' . date('YmdHis') . ($vin ? '_' . $vin : '') . '.zip';
         $zipPath = $targetDir . DIRECTORY_SEPARATOR . $zipFilename;
 
@@ -183,12 +220,12 @@ class VWEUDataActTelemetry extends IPSModule
                 @unlink($zipPath);
             }
             $this->SetStatus(202);
-            $this->SendDebug('DownloadAndImport', 'Download fehlgeschlagen oder HTTP Error ' . $httpCode, 0);
+            $this->SendDebug('DownloadAndImport', "Download-Fehler (HTTP {$httpCode}). Die Datei konnte nicht heruntergeladen werden.", 0);
             return false;
         }
 
         $this->SetStatus(102);
-        $this->SendDebug('DownloadAndImport', 'Neuer Telemetrie-Export erfolgreich heruntergeladen: ' . $zipFilename, 0);
+        $this->SendDebug('DownloadAndImport', 'Neuer Telemetrie-Export erfolgreich heruntergeladen: ' . $zipFilename . ' (' . filesize($zipPath) . ' Bytes)', 0);
 
         // Process downloaded ZIP file
         $this->ProcessZipFile($zipPath);
