@@ -10,8 +10,14 @@ class VWEUDataActTelemetry extends IPSModule
         parent::Create();
 
         // Register Module Properties
+        $this->RegisterPropertyString('SourceMode', 'file');
         $this->RegisterPropertyString('FilePath', '');
+        $this->RegisterPropertyString('PortalUsername', '');
+        $this->RegisterPropertyString('PortalPassword', '');
+        $this->RegisterPropertyString('PortalVIN', '');
         $this->RegisterPropertyInteger('PollInterval', 15);
+
+        // Feature Toggles
         $this->RegisterPropertyBoolean('EnableHVBattery', true);
         $this->RegisterPropertyBoolean('Enable12VBordnetz', true);
         $this->RegisterPropertyBoolean('EnableSecurity', true);
@@ -42,17 +48,241 @@ class VWEUDataActTelemetry extends IPSModule
             $this->SetTimerInterval('UpdateTimer', 0);
         }
 
-        // Validate FilePath Property
-        $filePath = $this->ResolvePath(trim($this->ReadPropertyString('FilePath')));
-        if (empty($filePath) || !file_exists($filePath)) {
-            $this->SetStatus(201); // File or folder not found
-            return;
+        $sourceMode = $this->ReadPropertyString('SourceMode');
+
+        if ($sourceMode === 'file') {
+            $filePath = $this->ResolvePath(trim($this->ReadPropertyString('FilePath')));
+            if (empty($filePath) || !file_exists($filePath)) {
+                $this->SetStatus(201); // File or folder not found
+                return;
+            }
+        } else {
+            $username = trim($this->ReadPropertyString('PortalUsername'));
+            $password = trim($this->ReadPropertyString('PortalPassword'));
+            if (empty($username) || empty($password)) {
+                $this->SetStatus(201); // Missing credentials
+                return;
+            }
         }
 
         $this->SetStatus(102); // OK / Active
 
         // Execute initial update
         $this->UpdateData();
+    }
+
+    /**
+     * Public method to trigger automated download & import from VW Data Act Portal
+     */
+    public function DownloadAndImport()
+    {
+        $username = trim($this->ReadPropertyString('PortalUsername'));
+        $password = trim($this->ReadPropertyString('PortalPassword'));
+        $vin = trim($this->ReadPropertyString('PortalVIN'));
+
+        if (empty($username) || empty($password)) {
+            $this->SetStatus(201);
+            $this->SendDebug('DownloadAndImport', 'Portal Zugangsdaten (E-Mail / Passwort) fehlen.', 0);
+            return false;
+        }
+
+        $targetDir = IPS_GetKernelDir() . 'user' . DIRECTORY_SEPARATOR . 'vwdataact_exports';
+        if (!is_dir($targetDir)) {
+            @mkdir($targetDir, 0777, true);
+        }
+
+        $cookieFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'vwda_cookie_' . $this->InstanceID . '.txt';
+
+        // Step 1: Initiate Portal Auth Session
+        $portalUrl = 'https://eu-data-act.drivesomethinggreater.com/';
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $portalUrl);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_COOKIEJAR, $cookieFile);
+        curl_setopt($ch, CURLOPT_COOKIEFILE, $cookieFile);
+        curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+        $html = curl_exec($ch);
+        $effectiveUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+
+        // Step 2: Post Login Credentials if login form redirected
+        if (strpos($effectiveUrl, 'auth') !== false || strpos($effectiveUrl, 'identity') !== false || strpos((string)$html, 'login') !== false) {
+            preg_match('/action="([^"]+)"/', (string)$html, $matches);
+            $loginUrl = isset($matches[1]) ? htmlspecialchars_decode($matches[1]) : $effectiveUrl;
+
+            curl_setopt($ch, CURLOPT_URL, $loginUrl);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+                'username' => $username,
+                'password' => $password
+            ]));
+            $loginResponse = curl_exec($ch);
+            $loginEffUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+
+            if (strpos((string)$loginResponse, 'error') !== false && strpos((string)$loginEffUrl, 'login') !== false) {
+                $this->SetStatus(203);
+                $this->SendDebug('DownloadAndImport', 'Portal-Anmeldung fehlgeschlagen (Falsche E-Mail/Passwort).', 0);
+                curl_close($ch);
+                @unlink($cookieFile);
+                return false;
+            }
+        }
+
+        // Step 3: Fetch Export List
+        $apiUrl = 'https://eu-data-act.drivesomethinggreater.com/api/v1/exports';
+        if (!empty($vin)) {
+            $apiUrl .= '?vin=' . urlencode($vin);
+        }
+        curl_setopt($ch, CURLOPT_URL, $apiUrl);
+        curl_setopt($ch, CURLOPT_HTTPGET, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Accept: application/json',
+            'X-Requested-With: XMLHttpRequest'
+        ]);
+        $exportJson = curl_exec($ch);
+
+        $downloadUrl = '';
+        $exportData = json_decode((string)$exportJson, true);
+        if (is_array($exportData)) {
+            $exports = $exportData['exports'] ?? $exportData['data'] ?? $exportData;
+            if (is_array($exports) && !empty($exports)) {
+                foreach ($exports as $exp) {
+                    if (isset($exp['downloadUrl']) || isset($exp['url'])) {
+                        $downloadUrl = $exp['downloadUrl'] ?? $exp['url'];
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Fallback if portal direct endpoint
+        if (empty($downloadUrl)) {
+            $downloadUrl = 'https://eu-data-act.drivesomethinggreater.com/api/v1/exports/latest/download';
+            if (!empty($vin)) {
+                $downloadUrl .= '?vin=' . urlencode($vin);
+            }
+        }
+
+        // Step 4: Download ZIP archive
+        $zipFilename = 'telemetry_' . date('YmdHis') . ($vin ? '_' . $vin : '') . '.zip';
+        $zipPath = $targetDir . DIRECTORY_SEPARATOR . $zipFilename;
+
+        $fp = fopen($zipPath, 'wb');
+        curl_setopt($ch, CURLOPT_URL, $downloadUrl);
+        curl_setopt($ch, CURLOPT_HTTPGET, true);
+        curl_setopt($ch, CURLOPT_FILE, $fp);
+        curl_setopt($ch, CURLOPT_HEADER, false);
+        $success = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        fclose($fp);
+        curl_close($ch);
+        @unlink($cookieFile);
+
+        if (!$success || $httpCode >= 400 || !file_exists($zipPath) || filesize($zipPath) < 100) {
+            if (file_exists($zipPath)) {
+                @unlink($zipPath);
+            }
+            $this->SetStatus(202);
+            $this->SendDebug('DownloadAndImport', 'Download fehlgeschlagen oder HTTP Error ' . $httpCode, 0);
+            return false;
+        }
+
+        $this->SetStatus(102);
+        $this->SendDebug('DownloadAndImport', 'Neuer Telemetrie-Export erfolgreich heruntergeladen: ' . $zipFilename, 0);
+
+        // Process downloaded ZIP file
+        $this->ProcessZipFile($zipPath);
+        return true;
+    }
+
+    /**
+     * Main Ingestion & Data Update function
+     */
+    public function UpdateData()
+    {
+        $sourceMode = $this->ReadPropertyString('SourceMode');
+        if ($sourceMode === 'api') {
+            $this->DownloadAndImport();
+            return;
+        }
+
+        $rawPath = trim($this->ReadPropertyString('FilePath'));
+        $filePath = $this->ResolvePath($rawPath);
+
+        if (empty($filePath) || !file_exists($filePath)) {
+            $this->SetStatus(201);
+            $this->SendDebug('UpdateData', 'Dateipfad ungültig oder nicht vorhanden: ' . $rawPath, 0);
+            return;
+        }
+
+        // Determine actual ZIP file path
+        $actualZipFile = '';
+        if (is_dir($filePath)) {
+            $zipFiles = glob(rtrim($filePath, '/\\') . '/*.zip');
+            if (!empty($zipFiles)) {
+                // Pick latest modified ZIP file
+                usort($zipFiles, function ($a, $b) {
+                    return filemtime($b) - filemtime($a);
+                });
+                $actualZipFile = $zipFiles[0];
+            }
+        } elseif (is_file($filePath) && strtolower(pathinfo($filePath, PATHINFO_EXTENSION)) === 'zip') {
+            $actualZipFile = $filePath;
+        }
+
+        if (empty($actualZipFile) || !file_exists($actualZipFile)) {
+            $this->SetStatus(202);
+            $this->SendDebug('UpdateData', 'Keine gültige ZIP-Datei gefunden in: ' . $filePath, 0);
+            return;
+        }
+
+        $this->ProcessZipFile($actualZipFile);
+    }
+
+    /**
+     * Process a ZIP file (Memory Extraction & Variable Update)
+     */
+    private function ProcessZipFile(string $actualZipFile)
+    {
+        // Open ZIP archive in memory
+        $zip = new ZipArchive();
+        if ($zip->open($actualZipFile) !== true) {
+            $this->SetStatus(202);
+            $this->SendDebug('ProcessZipFile', 'ZIP-Archiv konnte nicht geöffnet werden: ' . $actualZipFile, 0);
+            return;
+        }
+
+        // Find telemetry JSON file inside ZIP archive
+        $jsonString = '';
+        for ($i = 0; $i < $zip->numFiles; $i++) {
+            $filename = $zip->getNameIndex($i);
+            if (strtolower(pathinfo($filename, PATHINFO_EXTENSION)) === 'json') {
+                $jsonString = $zip->getFromIndex($i);
+                break;
+            }
+        }
+        $zip->close();
+
+        if (empty($jsonString)) {
+            $this->SetStatus(202);
+            $this->SendDebug('ProcessZipFile', 'Keine JSON-Datei im ZIP-Archiv enthalten.', 0);
+            return;
+        }
+
+        $payload = json_decode($jsonString, true);
+        if (!$payload || !is_array($payload)) {
+            $this->SetStatus(202);
+            $this->SendDebug('ProcessZipFile', 'JSON-Payload konnte nicht dekodiert werden.', 0);
+            return;
+        }
+
+        $this->SetStatus(102);
+
+        // Process telemetry payload
+        $this->ProcessPayload($payload);
+
+        // Render HTML Tile Dashboard
+        $this->RenderTileVisualization();
     }
 
     /**
@@ -66,7 +296,6 @@ class VWEUDataActTelemetry extends IPSModule
         if (file_exists($path)) {
             return $path;
         }
-        // Try relative to Symcon Root/Kernel directory (e.g. user/myexport.zip)
         $kernelPath = IPS_GetKernelDir() . ltrim($path, '/\\');
         if (file_exists($kernelPath)) {
             return $kernelPath;
@@ -225,82 +454,6 @@ class VWEUDataActTelemetry extends IPSModule
 
         // HTML Visualisierung (HTMLBox)
         $this->RegisterVariableString('Visualization', 'Fahrzeug Kachel-Dashboard', '~HTMLBox', 100);
-    }
-
-    /**
-     * Main Ingestion & Data Update function
-     */
-    public function UpdateData()
-    {
-        $rawPath = trim($this->ReadPropertyString('FilePath'));
-        $filePath = $this->ResolvePath($rawPath);
-
-        if (empty($filePath) || !file_exists($filePath)) {
-            $this->SetStatus(201);
-            $this->SendDebug('UpdateData', 'Dateipfad ungültig oder nicht vorhanden: ' . $rawPath, 0);
-            return;
-        }
-
-        // Determine actual ZIP file path
-        $actualZipFile = '';
-        if (is_dir($filePath)) {
-            $zipFiles = glob(rtrim($filePath, '/\\') . '/*.zip');
-            if (!empty($zipFiles)) {
-                // Pick latest modified ZIP file
-                usort($zipFiles, function ($a, $b) {
-                    return filemtime($b) - filemtime($a);
-                });
-                $actualZipFile = $zipFiles[0];
-            }
-        } elseif (is_file($filePath) && strtolower(pathinfo($filePath, PATHINFO_EXTENSION)) === 'zip') {
-            $actualZipFile = $filePath;
-        }
-
-        if (empty($actualZipFile) || !file_exists($actualZipFile)) {
-            $this->SetStatus(202);
-            $this->SendDebug('UpdateData', 'Keine gültige ZIP-Datei gefunden in: ' . $filePath, 0);
-            return;
-        }
-
-        // Open ZIP archive in memory
-        $zip = new ZipArchive();
-        if ($zip->open($actualZipFile) !== true) {
-            $this->SetStatus(202);
-            $this->SendDebug('UpdateData', 'ZIP-Archiv konnte nicht geöffnet werden: ' . $actualZipFile, 0);
-            return;
-        }
-
-        // Find telemetry JSON file inside ZIP archive
-        $jsonString = '';
-        for ($i = 0; $i < $zip->numFiles; $i++) {
-            $filename = $zip->getNameIndex($i);
-            if (strtolower(pathinfo($filename, PATHINFO_EXTENSION)) === 'json') {
-                $jsonString = $zip->getFromIndex($i);
-                break;
-            }
-        }
-        $zip->close();
-
-        if (empty($jsonString)) {
-            $this->SetStatus(202);
-            $this->SendDebug('UpdateData', 'Keine JSON-Datei im ZIP-Archiv enthalten.', 0);
-            return;
-        }
-
-        $payload = json_decode($jsonString, true);
-        if (!$payload || !is_array($payload)) {
-            $this->SetStatus(202);
-            $this->SendDebug('UpdateData', 'JSON-Payload konnte nicht dekodiert werden.', 0);
-            return;
-        }
-
-        $this->SetStatus(102);
-
-        // Process telemetry payload
-        $this->ProcessPayload($payload);
-
-        // Render HTML Tile Dashboard
-        $this->RenderTileVisualization();
     }
 
     /**

@@ -1,9 +1,39 @@
 {
     "elements": [
         {
+            "type": "Select",
+            "name": "SourceMode",
+            "caption": "Datenquelle",
+            "options": [
+                { "caption": "Ordner / Lokale ZIP-Datei", "value": "file" },
+                { "caption": "Automatischer Download vom Portal (drivesomethinggreater.com)", "value": "api" }
+            ]
+        },
+        {
             "type": "ValidationTextBox",
             "name": "FilePath",
-            "caption": "ZIP-Dateipfad oder Ordnerpfad zum Telemetrie-Export"
+            "caption": "ZIP-Dateipfad oder Ordnerpfad (für Lokalen Modus)"
+        },
+        {
+            "type": "ExpansionPanel",
+            "caption": "VW EU Data Act Portal Zugangsdaten (für Portal Download)",
+            "items": [
+                {
+                    "type": "ValidationTextBox",
+                    "name": "PortalUsername",
+                    "caption": "E-Mail (VW ID / myAudi / Cupra / SEAT ID)"
+                },
+                {
+                    "type": "PasswordTextBox",
+                    "name": "PortalPassword",
+                    "caption": "Passwort"
+                },
+                {
+                    "type": "ValidationTextBox",
+                    "name": "PortalVIN",
+                    "caption": "Fahrzeug-ID (VIN / FIN)"
+                }
+            ]
         },
         {
             "type": "NumberSpinner",
@@ -53,7 +83,12 @@
     "actions": [
         {
             "type": "Button",
-            "caption": "Jetzt Importieren & Aktualisieren",
+            "caption": "Vom Portal Herunterladen & Importieren",
+            "onClick": "VWDA_DownloadAndImport($id);"
+        },
+        {
+            "type": "Button",
+            "caption": "Lokale Daten Importieren & Aktualisieren",
             "onClick": "VWDA_UpdateData($id);"
         },
         {
@@ -71,12 +106,17 @@
         {
             "code": 201,
             "icon": "error",
-            "caption": "Dateipfad oder Ordner wurde nicht angegeben oder existiert nicht."
+            "caption": "Dateipfad oder Portal-Zugangsdaten nicht angegeben."
         },
         {
             "code": 202,
             "icon": "error",
-            "caption": "Fehler beim Auslesen oder Entpacken des Telemetrie-ZIPs."
+            "caption": "Fehler beim Lesen, Entpacken oder Portal-Download des Telemetrie-ZIPs."
+        },
+        {
+            "code": 203,
+            "icon": "error",
+            "caption": "Portal-Anmeldung (VW ID Login) fehlgeschlagen."
         }
     ]
 }
