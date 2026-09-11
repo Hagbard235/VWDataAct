@@ -5,8 +5,14 @@
             "name": "SourceMode",
             "caption": "Datenquelle",
             "options": [
-                { "caption": "Ordner / Lokale ZIP-Datei", "value": "file" },
-                { "caption": "Automatischer Download vom Portal (drivesomethinggreater.com)", "value": "api" }
+                {
+                    "caption": "Ordner / Lokale ZIP-Datei",
+                    "value": "file"
+                },
+                {
+                    "caption": "Automatischer Download vom Portal (drivesomethinggreater.com)",
+                    "value": "api"
+                }
             ]
         },
         {
@@ -117,6 +123,11 @@
             "code": 203,
             "icon": "error",
             "caption": "Portal-Anmeldung (VW ID Login) fehlgeschlagen."
+        },
+        {
+            "code": 204,
+            "icon": "error",
+            "caption": "Export gehört zu einer anderen VIN – Import verworfen."
         }
     ]
 }

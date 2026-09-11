@@ -149,6 +149,10 @@ class VWEUDataActTelemetry extends IPSModule
 
         $downloadUrl = '';
         $lastHttpCode = 0;
+        // FIX: collect ALL listed exports and pick the NEWEST one for the configured VIN.
+        // The old code took whatever the portal happened to list first, which is why an
+        // export from July kept being re-imported.
+        $fileCandidates = [];
 
         foreach ($candidateEndpoints as $endpoint) {
             $url = $endpoint;
@@ -174,26 +178,63 @@ class VWEUDataActTelemetry extends IPSModule
                     $items = $data['files'] ?? $data['data'] ?? $data['exports'] ?? $data['requests'] ?? $data;
                     if (is_array($items)) {
                         foreach ($items as $item) {
-                            if (is_array($item)) {
-                                $fileName = $item['fileName'] ?? $item['filename'] ?? $item['name'] ?? '';
-                                
-                                // Skip empty 'no_content_found' files!
-                                if (strpos($fileName, 'no_content_found') !== false) {
-                                    $this->SendDebug('DownloadAndImport', "Überspringe leere Datei: {$fileName}", 0);
-                                    continue;
-                                }
+                            if (!is_array($item)) {
+                                continue;
+                            }
+                            $fileName = $item['fileName'] ?? $item['filename'] ?? $item['name'] ?? '';
 
-                                if (isset($item['downloadUrl'])) {
-                                    $downloadUrl = $item['downloadUrl'];
-                                    break 2;
-                                } elseif (isset($item['url'])) {
-                                    $downloadUrl = $item['url'];
-                                    break 2;
-                                } elseif (isset($item['id'])) {
-                                    $downloadUrl = "https://eu-data-act.drivesomethinggreater.com/api/files/" . $item['id'] . "/download";
-                                    break 2;
+                            // Skip empty 'no_content_found' files!
+                            if (strpos($fileName, 'no_content_found') !== false) {
+                                $this->SendDebug('DownloadAndImport', "Ueberspringe leere Datei: {$fileName}", 0);
+                                continue;
+                            }
+
+                            // Only files of the configured vehicle.
+                            if (!empty($vin) && $fileName !== '' && strpos(strtoupper($fileName), strtoupper($vin)) === false) {
+                                $this->SendDebug('DownloadAndImport', "Ueberspringe fremde VIN: {$fileName}", 0);
+                                continue;
+                            }
+
+                            $url = '';
+                            if (isset($item['downloadUrl'])) {
+                                $url = $item['downloadUrl'];
+                            } elseif (isset($item['url'])) {
+                                $url = $item['url'];
+                            } elseif (isset($item['id'])) {
+                                $url = "https://eu-data-act.drivesomethinggreater.com/api/files/" . $item['id'] . "/download";
+                            }
+                            if ($url === '') {
+                                continue;
+                            }
+
+                            // Sort key: explicit date field, else the 14-digit stamp in the name.
+                            $sortKey = 0;
+                            foreach (['createdAt', 'created', 'createdDate', 'date', 'timestamp', 'generatedAt'] as $df) {
+                                if (!empty($item[$df])) {
+                                    $t = strtotime((string)$item[$df]);
+                                    if ($t !== false) {
+                                        $sortKey = $t;
+                                        break;
+                                    }
                                 }
                             }
+                            if ($sortKey === 0 && preg_match('/(\d{14})/', $fileName, $m)) {
+                                $sortKey = (int)strtotime(
+                                    substr($m[1], 0, 4) . '-' . substr($m[1], 4, 2) . '-' . substr($m[1], 6, 2) . ' ' .
+                                    substr($m[1], 8, 2) . ':' . substr($m[1], 10, 2) . ':' . substr($m[1], 12, 2)
+                                );
+                            }
+
+                            $fileCandidates[] = ['name' => $fileName, 'url' => $url, 'sort' => $sortKey];
+                        }
+
+                        if (!empty($fileCandidates)) {
+                            usort($fileCandidates, function ($a, $b) {
+                                return $b['sort'] <=> $a['sort'];
+                            });
+                            $downloadUrl = $fileCandidates[0]['url'];
+                            $this->SendDebug('DownloadAndImport', 'Gewaehlter Export: ' . $fileCandidates[0]['name'] . ' (von ' . count($fileCandidates) . ' Kandidaten)', 0);
+                            break;
                         }
                     }
                 }
@@ -261,22 +302,36 @@ class VWEUDataActTelemetry extends IPSModule
             return;
         }
 
-        // Determine actual ZIP file path (skipping no_content_found ZIPs if valid ZIPs exist)
+        // Determine actual ZIP file path.
+        // FIX: sort by the export timestamp encoded in the FILENAME (not by filemtime,
+        // which changes on copy/sync/restore and made old exports win), and only accept
+        // archives belonging to the configured VIN.
         $actualZipFile = '';
+        $wantVin = strtoupper(trim($this->ReadPropertyString('PortalVIN')));
+
         if (is_dir($filePath)) {
             $zipFiles = glob(rtrim($filePath, '/\\') . '/*.zip');
             if (!empty($zipFiles)) {
-                usort($zipFiles, function ($a, $b) {
-                    return filemtime($b) - filemtime($a);
-                });
+                $candidates = [];
                 foreach ($zipFiles as $zipCandidate) {
-                    if (strpos(basename($zipCandidate), 'no_content_found') === false && filesize($zipCandidate) > 100) {
-                        $actualZipFile = $zipCandidate;
-                        break;
+                    $base = basename($zipCandidate);
+                    if (strpos($base, 'no_content_found') !== false || filesize($zipCandidate) <= 100) {
+                        continue;
                     }
+                    if ($wantVin !== '' && strpos(strtoupper($base), $wantVin) === false) {
+                        $this->SendDebug('UpdateData', "Ueberspringe fremde VIN: {$base}", 0);
+                        continue;
+                    }
+                    $candidates[] = $zipCandidate;
                 }
-                if (empty($actualZipFile)) {
-                    $actualZipFile = $zipFiles[0];
+                if (!empty($candidates)) {
+                    usort($candidates, function ($a, $b) {
+                        $ka = $this->ExportSortKey($a);
+                        $kb = $this->ExportSortKey($b);
+                        return $kb <=> $ka;
+                    });
+                    $actualZipFile = $candidates[0];
+                    $this->SendDebug('UpdateData', 'Neuester Export: ' . basename($actualZipFile) . ' (Export-Zeit ' . date('d.m.Y H:i:s', $this->ExportSortKey($actualZipFile)) . ')', 0);
                 }
             }
         } elseif (is_file($filePath) && strtolower(pathinfo($filePath, PATHINFO_EXTENSION)) === 'zip') {
@@ -290,6 +345,25 @@ class VWEUDataActTelemetry extends IPSModule
         }
 
         $this->ProcessZipFile($actualZipFile);
+    }
+
+    /**
+     * Derive a sortable export timestamp from an export filename.
+     * Supports "20260721121617_VIN.zip" and "telemetry_20260721121617_VIN.zip".
+     * Falls back to filemtime when no timestamp is encoded.
+     */
+    private function ExportSortKey(string $file): int
+    {
+        if (preg_match('/(\d{14})/', basename($file), $m)) {
+            $t = strtotime(
+                substr($m[1], 0, 4) . '-' . substr($m[1], 4, 2) . '-' . substr($m[1], 6, 2) . ' ' .
+                substr($m[1], 8, 2) . ':' . substr($m[1], 10, 2) . ':' . substr($m[1], 12, 2)
+            );
+            if ($t !== false) {
+                return $t;
+            }
+        }
+        return (int)@filemtime($file);
     }
 
     /**
@@ -515,6 +589,15 @@ class VWEUDataActTelemetry extends IPSModule
     private function ProcessPayload(array $payload)
     {
         $vin = $payload['vin'] ?? '';
+
+        // FIX: never overwrite this instance's variables with another vehicle's export.
+        $wantVin = strtoupper(trim($this->ReadPropertyString('PortalVIN')));
+        if ($wantVin !== '' && $vin !== '' && strtoupper((string)$vin) !== $wantVin) {
+            $this->SendDebug('ProcessPayload', "Export gehoert zu VIN {$vin}, erwartet {$wantVin} - verworfen.", 0);
+            $this->SetStatus(204);
+            return;
+        }
+
         $this->SetValue('VIN', (string)$vin);
 
         $dataItems = $payload['Data'] ?? [];
@@ -522,28 +605,66 @@ class VWEUDataActTelemetry extends IPSModule
             return;
         }
 
-        // Build normalized lookup maps: fieldName -> value, key -> value
+        // FIX: the export lists history, not only the current state. The same normalized
+        // field name occurs hundreds of times (e.g. powerCurve.[*].timeCurve.[*].soc) and
+        // the same 'key' hash is reused for every point of a curve. Plain last-wins picked
+        // an arbitrary historical sample. Rank every entry and keep only the newest/highest.
         $fieldMap = [];
+        $rankMap  = [];
+
+        // A 'key' is only usable as an alias if it identifies exactly one data point.
+        $keyCount = [];
+        foreach ($dataItems as $item) {
+            if (isset($item['key'])) {
+                $k = $item['key'];
+                $keyCount[$k] = ($keyCount[$k] ?? 0) + 1;
+            }
+        }
+
+        $newestDataTs = 0;
+
         foreach ($dataItems as $item) {
             if (!isset($item['dataFieldName'])) {
                 continue;
             }
-            $fn = $item['dataFieldName'];
+            $fn  = $item['dataFieldName'];
             $val = $item['value'] ?? null;
             $key = $item['key'] ?? null;
 
-            $fieldMap[$fn] = $val;
+            // Rank: real timestamp if present (the export uses 1970-epoch placeholders for
+            // curve points), otherwise the largest array index inside the field name.
+            $rank = 0;
+            $tsRaw = $item['timestampUtc'] ?? '';
+            if (is_string($tsRaw) && $tsRaw !== '' && strpos($tsRaw, '1970') !== 0) {
+                $t = strtotime($tsRaw);
+                // The export also contains garbage stamps such as "N/A" and
+                // "+58488-10-05T11:48:29Z"; only accept a plausible window.
+                if ($t !== false && $t > 1420070400 && $t < time() + 86400) {
+                    $rank = $t;
+                    if ($t > $newestDataTs) {
+                        $newestDataTs = $t;
+                    }
+                }
+            }
+            if ($rank === 0 && preg_match_all('/\[(\d+)\]/', $fn, $mm)) {
+                foreach ($mm[1] as $ix) {
+                    $rank = max($rank, (int)$ix);
+                }
+            }
 
-            // Normalized index patterns like powerCurve.[0].soc -> powerCurve.[*].soc
+            $this->RankedSet($fieldMap, $rankMap, $fn, $val, $rank);
+
             $norm = preg_replace('/\[\d+\]/', '[*]', $fn);
-            $fieldMap[$norm] = $val;
+            $this->RankedSet($fieldMap, $rankMap, $norm, $val, $rank);
 
-            if ($key) {
-                $fieldMap[$key] = $val;
+            if ($key && ($keyCount[$key] ?? 0) === 1) {
+                $this->RankedSet($fieldMap, $rankMap, $key, $val, $rank);
             }
         }
 
-        $this->SetValue('LastUpdate', time());
+        // FIX: LastUpdate used to be time(), so stale imports still looked fresh.
+        // Report the age of the DATA, not the moment of the import.
+        $this->SetValue('LastUpdate', $newestDataTs > 0 ? $newestDataTs : time());
 
         // System / Metadata
         $isConnected = $fieldMap['isConnected'] ?? null;
@@ -789,6 +910,18 @@ class VWEUDataActTelemetry extends IPSModule
     /**
      * Helper to extract numeric value from candidate field names
      */
+    /**
+     * Store a value only if it ranks at least as high (newer / higher index)
+     * as whatever is already stored under that name.
+     */
+    private function RankedSet(array &$fieldMap, array &$rankMap, string $name, $value, int $rank)
+    {
+        if (!array_key_exists($name, $fieldMap) || $rank >= ($rankMap[$name] ?? PHP_INT_MIN)) {
+            $fieldMap[$name] = $value;
+            $rankMap[$name]  = $rank;
+        }
+    }
+
     private function ExtractFloat(array $fieldMap, array $candidates): ?float
     {
         foreach ($candidates as $cand) {
