@@ -1354,9 +1354,9 @@ class VWEUDataActTelemetry extends IPSModule
                 $this->SetValue('MaxCurrentL3', $maxL3);
             }
 
-            $plugState = $fieldMap['plugStatusItem.plugConnectionState'] ?? $fieldMap['plug_state'] ?? '';
-            if (!empty($plugState)) {
-                $this->SetValue('PlugConnectionState', (string)$plugState);
+            $plugState = $this->PlugConnectionState($fieldMap);
+            if ($plugState !== null) {
+                $this->SetValue('PlugConnectionState', $plugState);
             }
 
             $plugLock = $fieldMap['plugStatusItem.plugLockState'] ?? '';
@@ -1552,6 +1552,57 @@ class VWEUDataActTelemetry extends IPSModule
         }
 
         return true;
+    }
+
+    /**
+     * Plug connection state as CONNECTED / DISCONNECTED, or null if the dataset says nothing
+     * about it. The continuous datasets often carry no plug field at all; then the state is
+     * derived from charge state and charging scenario like evcc does.
+     */
+    private function PlugConnectionState(array $fieldMap): ?string
+    {
+        $plugFields = [
+            'plugStatusItem.plugConnectionState',
+            'plug_state',
+            'charging_plug1_connectionstate',
+            'plug_connection_state',
+            'plug_states.[*].plug_connection_state',
+            'ChargingEvent.[*].PlugStatus.[*].plugConnectionState',
+            'Plug Connection State'
+        ];
+        foreach ($plugFields as $field) {
+            $value = is_scalar($fieldMap[$field] ?? null) ? strtoupper((string)$fieldMap[$field]) : '';
+            if (strpos($value, 'DISCONNECTED') !== false) {
+                return 'DISCONNECTED';
+            }
+            if (strpos($value, 'CONNECTED') !== false) {
+                return 'CONNECTED';
+            }
+        }
+
+        // ready for charging, charging, conservation charging etc. require a plugged-in cable
+        $notReady = false;
+        foreach (['charging_state_report.current_charge_state', 'chargingStatus.currentChargeState', 'charging_state'] as $field) {
+            if (!is_scalar($fieldMap[$field] ?? null)) {
+                continue;
+            }
+            $state = strtoupper((string)preg_replace('/[^a-zA-Z]/', '', (string)$fieldMap[$field]));
+            if (strpos($state, 'NOTREADYFORCHARGING') !== false) {
+                $notReady = true;
+            } elseif (preg_match('/READYFORCHARGING|CHARGINGHVBATTERY|CONSERVATION|PURPOSEREACHED|DISCHARGING|^CHARGING$/', $state)) {
+                return 'CONNECTED';
+            }
+        }
+
+        // an active or finished charging scenario also means plugged in
+        foreach (['charging_state_report.charging_scenario', 'chargingStatus.chargingScenario'] as $field) {
+            $scenario = is_scalar($fieldMap[$field] ?? null) ? strtoupper((string)$fieldMap[$field]) : '';
+            if (preg_match('/_ACTIVE$|_FINISHED$|OPTIMISED_CHARGING_AC$/', $scenario)) {
+                return 'CONNECTED';
+            }
+        }
+
+        return $notReady ? 'DISCONNECTED' : null;
     }
 
     /**
