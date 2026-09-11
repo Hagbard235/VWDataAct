@@ -4,6 +4,28 @@ declare(strict_types=1);
 
 class VWEUDataActTelemetry extends IPSModule
 {
+    // EU Data Act portal and VW group identity service. The portal flow is ported from
+    // evcc (vehicle/vw/eudataact), which is based on ioBroker.vw-connect (lib/euDataAct.js).
+    private const PORTAL_BASE = 'https://eu-data-act.drivesomethinggreater.com';
+    private const PORTAL_HOST = 'eu-data-act.drivesomethinggreater.com';
+    private const IDENTITY_BASE = 'https://identity.vwgroup.io';
+    private const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+    // OIDC client id and state suffix per brand
+    private const BRANDS = [
+        'Volkswagen' => ['9b58543e-1c15-4193-91d5-8a14145bebb0@apps_vw-dilab_com', 'VOLKSWAGEN_PASSENGER_CARS'],
+        'Audi'       => ['cc29b87a-5e9a-4362-aecf-5adea6b01bbb@apps_vw-dilab_com', 'AUDI'],
+        'Skoda'      => ['3ea88bf9-1d4e-4a68-b3ad-4098c1f1d246@apps_vw-dilab_com', 'SKODA'],
+        'Seat'       => ['f85e5b69-e3b2-43aa-9c0d-1b7d0e0b576f@apps_vw-dilab_com', 'SEAT'],
+        'Cupra'      => ['f85e5b69-e3b2-43aa-9c0d-1b7d0e0b576f@apps_vw-dilab_com', 'CUPRA']
+    ];
+
+    // Number of newest datasets merged on the first portal import
+    private const MAX_BACKFILL = 8;
+
+    // Number of downloaded datasets kept in user/vwdataact_exports
+    private const KEEP_EXPORTS = 50;
+
     public function Create()
     {
         // Always call parent first
@@ -15,7 +37,12 @@ class VWEUDataActTelemetry extends IPSModule
         $this->RegisterPropertyString('PortalUsername', '');
         $this->RegisterPropertyString('PortalPassword', '');
         $this->RegisterPropertyString('PortalVIN', '');
+        $this->RegisterPropertyString('PortalBrand', 'Volkswagen');
         $this->RegisterPropertyInteger('PollInterval', 15);
+
+        // Portal import state: delivery time and VIN of the newest imported dataset
+        $this->RegisterAttributeInteger('LastDatasetCreatedOn', 0);
+        $this->RegisterAttributeString('LastDatasetVIN', '');
 
         // Feature Toggles
         $this->RegisterPropertyBoolean('EnableHVBattery', true);
@@ -72,17 +99,27 @@ class VWEUDataActTelemetry extends IPSModule
     }
 
     /**
-     * Public method to trigger automated download & import from VW Data Act Portal
+     * Public method to trigger automated download & import from VW Data Act Portal.
+     *
+     * The portal is not a live API: it stores a dataset whenever the vehicle reports
+     * something and only ever appends. Datasets are partial, so every run imports all
+     * datasets delivered after the newest one already imported, oldest first.
      */
     public function DownloadAndImport()
     {
         $username = trim($this->ReadPropertyString('PortalUsername'));
         $password = trim($this->ReadPropertyString('PortalPassword'));
-        $vin = trim($this->ReadPropertyString('PortalVIN'));
+        $vin = strtoupper(trim($this->ReadPropertyString('PortalVIN')));
+        $brandName = $this->ReadPropertyString('PortalBrand');
 
         if (empty($username) || empty($password)) {
             $this->SetStatus(201);
             $this->SendDebug('DownloadAndImport', 'Portal Zugangsdaten (E-Mail / Passwort) fehlen.', 0);
+            return false;
+        }
+        if (!isset(self::BRANDS[$brandName])) {
+            $this->SetStatus(201);
+            $this->SendDebug('DownloadAndImport', 'Unbekannte Marke: ' . $brandName, 0);
             return false;
         }
 
@@ -91,195 +128,545 @@ class VWEUDataActTelemetry extends IPSModule
             @mkdir($targetDir, 0777, true);
         }
 
+        // The cookie file keeps the portal session between runs; the module only logs in
+        // again when the portal rejects the session.
         $cookieFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'vwda_cookie_' . $this->InstanceID . '.txt';
-        if (file_exists($cookieFile)) {
-            @unlink($cookieFile);
-        }
-
-        // Step 1: Initiate Portal Auth Session
-        $this->SendDebug('DownloadAndImport', 'Schritt 1: Portal-Sitzung initiieren...', 0);
-        $portalUrl = 'https://eu-data-act.drivesomethinggreater.com/';
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $portalUrl);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_COOKIEJAR, $cookieFile);
-        curl_setopt($ch, CURLOPT_COOKIEFILE, $cookieFile);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-        curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        $html = curl_exec($ch);
-        $effectiveUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
-
-        // Step 2: Post Login Credentials if login form redirected
-        $this->SendDebug('DownloadAndImport', 'Schritt 2: Authentifizierung an IPD/OIDC Portal...', 0);
-        if (strpos($effectiveUrl, 'auth') !== false || strpos($effectiveUrl, 'identity') !== false || strpos((string)$html, 'login') !== false || strpos((string)$html, 'username') !== false) {
-            preg_match('/action="([^"]+)"/', (string)$html, $matches);
-            $loginUrl = isset($matches[1]) ? htmlspecialchars_decode($matches[1]) : $effectiveUrl;
-
-            curl_setopt($ch, CURLOPT_URL, $loginUrl);
-            curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
-                'username' => $username,
-                'password' => $password
-            ]));
-            $loginResponse = curl_exec($ch);
-            $loginEffUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
-            $this->SendDebug('DownloadAndImport', 'Login-Antwort URL: ' . $loginEffUrl, 0);
-
-            if (strpos((string)$loginResponse, 'error') !== false && (strpos((string)$loginEffUrl, 'login') !== false || strpos((string)$loginEffUrl, 'auth') !== false)) {
-                $this->SetStatus(203);
-                $this->SendDebug('DownloadAndImport', 'Portal-Anmeldung fehlgeschlagen (Falsche E-Mail/Passwort oder MFA erforderlich).', 0);
-                curl_close($ch);
-                @unlink($cookieFile);
-                return false;
-            }
-        }
-
-        // Step 3: Fetch Files / Exports List
-        $this->SendDebug('DownloadAndImport', 'Schritt 3: Abrufen der verfügbaren Telemetriedateien für VIN: ' . ($vin ?: 'Alle'), 0);
-        
-        $candidateEndpoints = [
-            'https://eu-data-act.drivesomethinggreater.com/api/files',
-            'https://eu-data-act.drivesomethinggreater.com/api/v1/files',
-            'https://eu-data-act.drivesomethinggreater.com/api/data-requests',
-            'https://eu-data-act.drivesomethinggreater.com/api/v1/data-requests',
-            'https://eu-data-act.drivesomethinggreater.com/api/exports',
-            'https://eu-data-act.drivesomethinggreater.com/api/v1/exports'
+        $ch = $this->PortalCurl($cookieFile);
+        $session = [
+            'brand'    => self::BRANDS[$brandName],
+            'user'     => $username,
+            'password' => $password,
+            'loggedIn' => false
         ];
 
-        $downloadUrl = '';
-        $lastHttpCode = 0;
-        // FIX: collect ALL listed exports and pick the NEWEST one for the configured VIN.
-        // The old code took whatever the portal happened to list first, which is why an
-        // export from July kept being re-imported.
-        $fileCandidates = [];
+        try {
+            if ($vin === '') {
+                $vin = $this->PortalFindVin($ch, $session);
+            }
+            $vinPath = rawurlencode($vin);
 
-        foreach ($candidateEndpoints as $endpoint) {
-            $url = $endpoint;
-            if (!empty($vin)) {
-                $url .= '?vin=' . urlencode($vin);
+            // Step 1: identifier of the data request
+            $this->SendDebug('DownloadAndImport', 'Schritt 1: Datenanfrage für VIN ' . $vin . ' abrufen...', 0);
+            $res = $this->PortalGet($ch, self::PORTAL_BASE . '/proxy_api/euda-apim/datarequest/vehicles/' . $vinPath . '/metadata/partial', ['Accept: application/json'], $session);
+            if ($res['code'] === 404) {
+                throw new Exception('Für VIN ' . $vin . ' ist im Portal keine Datenanfrage eingerichtet (HTTP 404).', 205);
+            }
+            if ($res['code'] >= 400) {
+                throw new Exception('Datenanfrage konnte nicht gelesen werden (HTTP ' . $res['code'] . ').', 206);
+            }
+            $meta = json_decode($res['body'], true);
+            $identifier = is_array($meta) ? (string)($meta['Identifier'] ?? '') : '';
+            if ($identifier === '') {
+                throw new Exception('Das Portal liefert keine Kennung der Datenanfrage - Datenanfrage im Portal prüfen.', 205);
+            }
+            $dataUrl = self::PORTAL_BASE . '/proxy_api/euda-apim/datadelivery/vehicles/' . $vinPath . '/' . rawurlencode($identifier);
+
+            // Step 2: delivered datasets
+            $this->SendDebug('DownloadAndImport', 'Schritt 2: Liste der Datensätze abrufen...', 0);
+            $res = $this->PortalGet($ch, $dataUrl . '/list', ['Accept: application/json', 'type: partial'], $session);
+            $list = [];
+            if ($res['code'] === 404) {
+                // "No files available for this request" until the vehicle delivered its first dataset
+                $this->SendDebug('DownloadAndImport', 'Das Portal hat noch keine Datensätze für dieses Fahrzeug.', 0);
+            } elseif ($res['code'] >= 400) {
+                throw new Exception('Liste der Datensätze konnte nicht gelesen werden (HTTP ' . $res['code'] . ').', 206);
+            } else {
+                $decoded = json_decode($res['body'], true);
+                if (is_array($decoded) && isset($decoded['files']) && is_array($decoded['files'])) {
+                    $list = $decoded['files'];
+                } elseif (is_array($decoded) && ($decoded === [] || isset($decoded[0]))) {
+                    $list = $decoded;
+                } else {
+                    throw new Exception('Unerwartete Antwort auf die Liste der Datensätze: ' . substr($res['body'], 0, 200), 206);
+                }
             }
 
-            curl_setopt($ch, CURLOPT_URL, $url);
+            $datasets = $this->ContentDatasets($list);
+            $summary = count($list) . ' Einträge im Portal, davon ' . count($datasets) . ' mit Inhalt';
+            if (!empty($datasets)) {
+                $summary .= ', neuester vom ' . date('d.m.Y H:i:s', $datasets[count($datasets) - 1]['ts']);
+            }
+            $this->SendDebug('DownloadAndImport', $summary, 0);
+
+            // Step 3: datasets not imported yet
+            $after = $this->ReadAttributeInteger('LastDatasetCreatedOn');
+            if ($this->ReadAttributeString('LastDatasetVIN') !== $vin) {
+                $after = 0;
+            }
+            $pending = $this->PendingDatasets($datasets, $after);
+
+            if (empty($pending)) {
+                $this->SetStatus(102);
+                $this->SendDebug('DownloadAndImport', 'Keine neuen Datensätze' . ($after > 0 ? ' seit ' . date('d.m.Y H:i:s', $after) : '') . ' - das Portal liefert nur, wenn am Fahrzeug etwas passiert.', 0);
+                return true;
+            }
+
+            // Step 4: download and import, oldest first
+            $imported = 0;
+            foreach ($pending as $dataset) {
+                $this->SendDebug('DownloadAndImport', 'Schritt 4: Lade ' . $dataset['name'] . ' (' . date('d.m.Y H:i:s', $dataset['ts']) . ')...', 0);
+                $res = $this->PortalGet($ch, $dataUrl . '/download', [
+                    'filename: ' . str_replace(["\r", "\n"], '', $dataset['name']),
+                    'type: partial'
+                ], $session);
+                if ($res['code'] >= 400 || strncmp($res['body'], 'PK', 2) !== 0) {
+                    throw new Exception('Download von ' . $dataset['name'] . ' fehlgeschlagen (HTTP ' . $res['code'] . ', ' . strlen($res['body']) . ' Bytes, keine ZIP-Datei).', 202);
+                }
+
+                $zipPath = $targetDir . DIRECTORY_SEPARATOR . basename($dataset['name']);
+                if (file_put_contents($zipPath, $res['body']) === false) {
+                    throw new Exception('ZIP-Datei konnte nicht gespeichert werden: ' . $zipPath, 202);
+                }
+
+                // An unreadable dataset is skipped so it cannot block all newer ones.
+                if ($this->ProcessZipFile($zipPath, $dataset['ts'])) {
+                    $imported++;
+                } else {
+                    $this->LogMessage('VWDataAct: Datensatz ' . $dataset['name'] . ' konnte nicht importiert werden und wird übersprungen.', KL_WARNING);
+                }
+
+                $this->WriteAttributeInteger('LastDatasetCreatedOn', $dataset['ts']);
+                $this->WriteAttributeString('LastDatasetVIN', $vin);
+            }
+
+            $this->PruneExports($targetDir);
+            $this->SendDebug('DownloadAndImport', $imported . ' von ' . count($pending) . ' Datensätzen importiert.', 0);
+            return $imported === count($pending);
+        } catch (Exception $e) {
+            $code = $e->getCode();
+            $this->SetStatus(in_array($code, [201, 202, 203, 205, 206], true) ? $code : 206);
+            $this->SendDebug('DownloadAndImport', 'FEHLER: ' . $e->getMessage(), 0);
+            $this->LogMessage('VWDataAct: ' . $e->getMessage(), KL_ERROR);
+            return false;
+        } finally {
+            // Persist the session cookies for the next run
+            curl_setopt($ch, CURLOPT_COOKIELIST, 'FLUSH');
+            unset($ch);
+        }
+    }
+
+    /**
+     * Forget which portal datasets were imported; the next run imports the newest ones again.
+     */
+    public function ResetPortalState()
+    {
+        $this->WriteAttributeInteger('LastDatasetCreatedOn', 0);
+        $this->WriteAttributeString('LastDatasetVIN', '');
+        $this->SendDebug('ResetPortalState', 'Portal-Stand zurückgesetzt - der nächste Abruf lädt die neuesten ' . self::MAX_BACKFILL . ' Datensätze.', 0);
+    }
+
+    /**
+     * Returns the VIN of the only vehicle linked in the portal.
+     */
+    private function PortalFindVin($ch, array &$session): string
+    {
+        $res = $this->PortalGet($ch, self::PORTAL_BASE . '/proxy_api/consent/me/vehicles?viewPosition=FRONT_LEFT', ['Accept: application/json'], $session);
+        if ($res['code'] >= 400) {
+            throw new Exception('Fahrzeugliste konnte nicht gelesen werden (HTTP ' . $res['code'] . ').', 206);
+        }
+
+        // the response is either a bare array or wrapped in {"vehicles": [...]}
+        $decoded = json_decode($res['body'], true);
+        $vehicles = [];
+        if (is_array($decoded)) {
+            $vehicles = (isset($decoded['vehicles']) && is_array($decoded['vehicles'])) ? $decoded['vehicles'] : $decoded;
+        }
+
+        $vins = [];
+        foreach ($vehicles as $vehicle) {
+            if (!is_array($vehicle)) {
+                continue;
+            }
+            $found = (string)($vehicle['vin'] ?? '');
+            if ($found === '') {
+                $found = (string)($vehicle['vehicleIdentificationNumber'] ?? '');
+            }
+            if ($found !== '') {
+                $vins[] = strtoupper($found);
+            }
+        }
+
+        if (count($vins) === 1) {
+            $this->SendDebug('PortalFindVin', 'Fahrzeug im Portal gefunden: ' . $vins[0], 0);
+            return $vins[0];
+        }
+        if (empty($vins)) {
+            throw new Exception('Im Portal ist kein Fahrzeug verknüpft.', 205);
+        }
+        throw new Exception('Mehrere Fahrzeuge im Portal (' . implode(', ', $vins) . ') - bitte die VIN in der Instanz eintragen.', 201);
+    }
+
+    private function PortalCurl(string $cookieFile)
+    {
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 20);
+        curl_setopt($ch, CURLOPT_COOKIEJAR, $cookieFile);
+        curl_setopt($ch, CURLOPT_COOKIEFILE, $cookieFile);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 15);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+        curl_setopt($ch, CURLOPT_ENCODING, '');
+        curl_setopt($ch, CURLOPT_USERAGENT, self::USER_AGENT);
+        return $ch;
+    }
+
+    /**
+     * Executes a request on the shared handle (redirects and cookies included).
+     */
+    private function PortalRequest($ch, string $method, string $url, array $headers = [], array $form = []): array
+    {
+        curl_setopt($ch, CURLOPT_URL, $url);
+        if ($method === 'POST') {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($form));
+        } else {
             curl_setopt($ch, CURLOPT_HTTPGET, true);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                'Accept: application/json, text/plain, */*',
-                'X-Requested-With: XMLHttpRequest'
-            ]);
-            $response = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $lastHttpCode = $httpCode;
+        }
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
 
-            $this->SendDebug('DownloadAndImport', "Endpoint {$endpoint} => HTTP Code {$httpCode}", 0);
+        $body = curl_exec($ch);
 
-            if ($httpCode === 200 && !empty($response)) {
-                $data = json_decode((string)$response, true);
-                if (is_array($data)) {
-                    $items = $data['files'] ?? $data['data'] ?? $data['exports'] ?? $data['requests'] ?? $data;
-                    if (is_array($items)) {
-                        foreach ($items as $item) {
-                            if (!is_array($item)) {
-                                continue;
-                            }
-                            $fileName = $item['fileName'] ?? $item['filename'] ?? $item['name'] ?? '';
+        return [
+            'code'  => (int)curl_getinfo($ch, CURLINFO_HTTP_CODE),
+            'url'   => (string)curl_getinfo($ch, CURLINFO_EFFECTIVE_URL),
+            'body'  => is_string($body) ? $body : '',
+            'error' => $body === false ? curl_error($ch) : ''
+        ];
+    }
 
-                            // Skip empty 'no_content_found' files!
-                            if (strpos($fileName, 'no_content_found') !== false) {
-                                $this->SendDebug('DownloadAndImport', "Ueberspringe leere Datei: {$fileName}", 0);
-                                continue;
-                            }
+    /**
+     * True if the portal answered with a login redirect or page instead of data.
+     */
+    private function PortalNeedsLogin(array $res): bool
+    {
+        if ($res['code'] === 401 || $res['code'] === 403) {
+            return true;
+        }
+        $host = (string)parse_url($res['url'], PHP_URL_HOST);
+        if ($host !== '' && $host !== self::PORTAL_HOST) {
+            return true;
+        }
+        return $res['code'] === 200 && strncmp(ltrim($res['body']), '<', 1) === 0;
+    }
 
-                            // Only files of the configured vehicle.
-                            if (!empty($vin) && $fileName !== '' && strpos(strtoupper($fileName), strtoupper($vin)) === false) {
-                                $this->SendDebug('DownloadAndImport', "Ueberspringe fremde VIN: {$fileName}", 0);
-                                continue;
-                            }
+    /**
+     * GET on the portal API, logging in once if the session is missing or expired.
+     */
+    private function PortalGet($ch, string $url, array $headers, array &$session): array
+    {
+        $res = $this->PortalRequest($ch, 'GET', $url, $headers);
+        if ($res['error'] === '' && !$session['loggedIn'] && $this->PortalNeedsLogin($res)) {
+            $this->SendDebug('PortalGet', 'Keine gültige Portal-Sitzung (HTTP ' . $res['code'] . ') - Anmeldung...', 0);
+            $this->PortalLogin($ch, $session);
+            $session['loggedIn'] = true;
+            $res = $this->PortalRequest($ch, 'GET', $url, $headers);
+        }
 
-                            $url = '';
-                            if (isset($item['downloadUrl'])) {
-                                $url = $item['downloadUrl'];
-                            } elseif (isset($item['url'])) {
-                                $url = $item['url'];
-                            } elseif (isset($item['id'])) {
-                                $url = "https://eu-data-act.drivesomethinggreater.com/api/files/" . $item['id'] . "/download";
-                            }
-                            if ($url === '') {
-                                continue;
-                            }
+        if ($res['error'] !== '') {
+            throw new Exception('Portal nicht erreichbar: ' . $res['error'], 202);
+        }
+        if ($this->PortalNeedsLogin($res)) {
+            throw new Exception('Das Portal verweigert den Zugriff trotz Anmeldung (HTTP ' . $res['code'] . ', ' . explode('?', $res['url'], 2)[0] . ').', 203);
+        }
+        return $res;
+    }
 
-                            // Sort key: explicit date field, else the 14-digit stamp in the name.
-                            $sortKey = 0;
-                            foreach (['createdAt', 'created', 'createdDate', 'date', 'timestamp', 'generatedAt'] as $df) {
-                                if (!empty($item[$df])) {
-                                    $t = strtotime((string)$item[$df]);
-                                    if ($t !== false) {
-                                        $sortKey = $t;
-                                        break;
-                                    }
-                                }
-                            }
-                            if ($sortKey === 0 && preg_match('/(\d{14})/', $fileName, $m)) {
-                                $sortKey = (int)strtotime(
-                                    substr($m[1], 0, 4) . '-' . substr($m[1], 4, 2) . '-' . substr($m[1], 6, 2) . ' ' .
-                                    substr($m[1], 8, 2) . ':' . substr($m[1], 10, 2) . ':' . substr($m[1], 12, 2)
-                                );
-                            }
+    /**
+     * OIDC authorization-code login at the VW group identity service. The portal sets its
+     * session cookie while the redirect chain leads back to the portal.
+     */
+    private function PortalLogin($ch, array $session): void
+    {
+        [$clientId, $brandState] = $session['brand'];
 
-                            $fileCandidates[] = ['name' => $fileName, 'url' => $url, 'sort' => $sortKey];
-                        }
+        // start with a fresh session
+        curl_setopt($ch, CURLOPT_COOKIELIST, 'ALL');
 
-                        if (!empty($fileCandidates)) {
-                            usort($fileCandidates, function ($a, $b) {
-                                return $b['sort'] <=> $a['sort'];
-                            });
-                            $downloadUrl = $fileCandidates[0]['url'];
-                            $this->SendDebug('DownloadAndImport', 'Gewaehlter Export: ' . $fileCandidates[0]['name'] . ' (von ' . count($fileCandidates) . ' Kandidaten)', 0);
-                            break;
-                        }
-                    }
+        // prime the portal session (best effort)
+        $this->PortalRequest($ch, 'GET', self::PORTAL_BASE . '/');
+
+        $query = http_build_query([
+            'client_id'     => $clientId,
+            'response_type' => 'code',
+            'scope'         => 'openid cars profile',
+            'state'         => 'de__en__' . $brandState,
+            'redirect_uri'  => self::PORTAL_BASE . '/login',
+            'prompt'        => 'login',
+            'nonce'         => $this->RandomString(43)
+        ]);
+        $res = $this->PortalRequest($ch, 'GET', self::IDENTITY_BASE . '/oidc/v1/authorize?' . $query);
+        if ($res['error'] !== '' || $res['code'] >= 400) {
+            throw new Exception('Login-Seite nicht erreichbar (HTTP ' . $res['code'] . ') ' . $res['error'], 203);
+        }
+
+        $form = $this->ParseHtmlForm($res['body'], 'emailPasswordForm');
+        if ($form !== null) {
+            $res = $this->PortalLoginLegacy($ch, $form, $session['user'], $session['password']);
+        } else {
+            $res = $this->PortalLoginNew($ch, $res['body'], $session['user'], $session['password']);
+        }
+
+        $final = $res['url'];
+        $path = (string)parse_url($final, PHP_URL_PATH);
+
+        // VW periodically interjects an optional marketing consent page after an otherwise
+        // successful login. Skip it without consenting.
+        if (strpos($path, '/consent/marketing/') !== false) {
+            parse_str((string)parse_url($final, PHP_URL_QUERY), $query);
+            $callback = is_string($query['callback'] ?? null) ? $query['callback'] : '';
+            if ($callback === '') {
+                throw new Exception('Marketing-Einwilligung ohne Callback-URL - bitte einmal im Browser im Portal anmelden.', 203);
+            }
+            $this->SendDebug('PortalLogin', 'Überspringe Marketing-Einwilligung (ohne Zustimmung).', 0);
+            $res = $this->PortalRequest($ch, 'GET', $this->NormalizeUrlQuery($callback));
+            $final = $res['url'];
+            $path = (string)parse_url($final, PHP_URL_PATH);
+        }
+
+        // A successful login lands on the portal; a remaining signin/consent page means a
+        // wrong password or a consent that has to be confirmed once in the browser.
+        if (strpos($path, 'signin-service') !== false || strpos($path, '/consent') !== false || strpos($path, '/error') !== false) {
+            parse_str((string)parse_url($final, PHP_URL_QUERY), $query);
+            $reason = is_string($query['error'] ?? null) ? ' (' . $query['error'] . ')' : '';
+            throw new Exception('Anmeldung nicht abgeschlossen' . $reason . ' - Passwort prüfen bzw. im Browser im Portal anmelden und Einwilligung bestätigen: ' . explode('?', $final, 2)[0], 203);
+        }
+        if ((string)parse_url($final, PHP_URL_HOST) !== self::PORTAL_HOST) {
+            throw new Exception('Anmeldung nicht abgeschlossen, unerwartete Zielseite: ' . explode('?', $final, 2)[0], 203);
+        }
+
+        $this->SendDebug('PortalLogin', 'Anmeldung erfolgreich.', 0);
+    }
+
+    /**
+     * Identity login with separate email and password pages.
+     */
+    private function PortalLoginLegacy($ch, array $form, string $user, string $password): array
+    {
+        // email / identifier step
+        $uri = strpos($form['action'], 'https://') === 0 ? $form['action'] : self::IDENTITY_BASE . $form['action'];
+        $res = $this->PortalRequest($ch, 'POST', $uri, [], [
+            '_csrf'      => $form['inputs']['_csrf'] ?? '',
+            'relayState' => $form['inputs']['relayState'] ?? '',
+            'hmac'       => $form['inputs']['hmac'] ?? '',
+            'email'      => $user
+        ]);
+        if ($res['error'] !== '' || $res['code'] >= 400) {
+            throw new Exception('Anmeldung: E-Mail-Schritt fehlgeschlagen (HTTP ' . $res['code'] . ') ' . $res['error'], 203);
+        }
+
+        $idk = $this->ParseIdk($res['body']);
+        if ($idk === null) {
+            throw new Exception('Anmeldung: Passwort-Seite nicht erkannt - Login-Seite von VW geändert?', 203);
+        }
+        $model = is_array($idk['templateModel'] ?? null) ? $idk['templateModel'] : [];
+        if (!empty($model['error'])) {
+            throw new Exception('Anmeldung abgelehnt: ' . (string)$model['error'], 203);
+        }
+        $identifierUrl = (string)($model['identifierUrl'] ?? '');
+        $postAction = (string)($model['postAction'] ?? '');
+        if ($identifierUrl === '' || $postAction === '' || strpos($uri, $identifierUrl) === false) {
+            throw new Exception('Anmeldung: Passwort-Formular unvollständig - Login-Seite von VW geändert?', 203);
+        }
+
+        // password / authenticate step, the redirect chain leads back to the portal
+        $uri = str_replace($identifierUrl, $postAction, $uri);
+        $res = $this->PortalRequest($ch, 'POST', $uri, [], [
+            '_csrf'      => (string)($idk['csrf_token'] ?? ''),
+            'relayState' => (string)($model['relayState'] ?? ''),
+            'hmac'       => (string)($model['hmac'] ?? ''),
+            'email'      => $user,
+            'password'   => $password
+        ]);
+        if ($res['error'] !== '' || $res['code'] >= 400) {
+            throw new Exception('Anmeldung: Passwort-Schritt fehlgeschlagen (HTTP ' . $res['code'] . ') ' . $res['error'], 203);
+        }
+        return $res;
+    }
+
+    /**
+     * Newer identity login with a single username/password form (see evcc vwidentity.loginNew).
+     */
+    private function PortalLoginNew($ch, string $html, string $user, string $password): array
+    {
+        $state = '';
+        if (preg_match_all('/<input\b[^>]*>/i', $html, $tags)) {
+            foreach ($tags[0] as $tag) {
+                if ($this->HtmlAttr($tag, 'name') === 'state') {
+                    $state = (string)$this->HtmlAttr($tag, 'value');
+                    break;
                 }
             }
         }
-
-        if (empty($downloadUrl)) {
-            $this->SetStatus(102); // Keep status active if last export was empty
-            $this->SendDebug('DownloadAndImport', "HINWEIS: Der aktuellste Portal-Export ist leer (no_content_found.zip - Fahrzeug stand/schläft). Die bisherigen Statusvariablen bleiben erhalten.", 0);
-            curl_close($ch);
-            @unlink($cookieFile);
-            return true;
+        if ($state === '') {
+            throw new Exception('Anmeldung: kein Login-Formular erkannt - Login-Seite von VW geändert?', 203);
         }
 
-        // Step 4: Download ZIP Archive
-        $this->SendDebug('DownloadAndImport', 'Schritt 4: Lade gültige Telemetrie-ZIP herunter von: ' . $downloadUrl, 0);
-        $zipFilename = 'telemetry_' . date('YmdHis') . ($vin ? '_' . $vin : '') . '.zip';
-        $zipPath = $targetDir . DIRECTORY_SEPARATOR . $zipFilename;
+        $res = $this->PortalRequest($ch, 'POST', self::IDENTITY_BASE . '/u/login?state=' . rawurlencode($state), [], [
+            'username' => $user,
+            'password' => $password,
+            'state'    => $state
+        ]);
+        if ($res['error'] !== '' || $res['code'] >= 400) {
+            throw new Exception('Anmeldung fehlgeschlagen (HTTP ' . $res['code'] . ') ' . $res['error'], 203);
+        }
+        return $res;
+    }
 
-        $fp = fopen($zipPath, 'wb');
-        curl_setopt($ch, CURLOPT_URL, $downloadUrl);
-        curl_setopt($ch, CURLOPT_HTTPGET, true);
-        curl_setopt($ch, CURLOPT_FILE, $fp);
-        curl_setopt($ch, CURLOPT_HEADER, false);
-        $success = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        fclose($fp);
-        curl_close($ch);
-        @unlink($cookieFile);
-
-        if (!$success || $httpCode >= 400 || !file_exists($zipPath) || filesize($zipPath) < 100) {
-            if (file_exists($zipPath)) {
-                @unlink($zipPath);
+    /**
+     * Action and input values of the form with the given id, or null if absent.
+     */
+    private function ParseHtmlForm(string $html, string $id): ?array
+    {
+        if (!preg_match_all('/<form\b[^>]*>.*?<\/form>/is', $html, $forms)) {
+            return null;
+        }
+        foreach ($forms[0] as $form) {
+            if (!preg_match('/^<form\b[^>]*>/i', $form, $open) || $this->HtmlAttr($open[0], 'id') !== $id) {
+                continue;
             }
-            $this->SetStatus(202);
-            $this->SendDebug('DownloadAndImport', "Download-Fehler (HTTP {$httpCode}).", 0);
-            return false;
+            $action = $this->HtmlAttr($open[0], 'action');
+            if ($action === null) {
+                return null;
+            }
+            $inputs = [];
+            if (preg_match_all('/<input\b[^>]*>/i', $form, $tags)) {
+                foreach ($tags[0] as $tag) {
+                    $name = $this->HtmlAttr($tag, 'name');
+                    if ($name !== null) {
+                        $inputs[$name] = (string)$this->HtmlAttr($tag, 'value');
+                    }
+                }
+            }
+            return ['action' => $action, 'inputs' => $inputs];
+        }
+        return null;
+    }
+
+    private function HtmlAttr(string $tag, string $name): ?string
+    {
+        if (!preg_match('/[\s"\']' . preg_quote($name, '/') . '\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'>]+))/i', $tag, $m)) {
+            return null;
+        }
+        $value = $m[1];
+        if ($value === '' && isset($m[2]) && $m[2] !== '') {
+            $value = $m[2];
+        }
+        if ($value === '' && isset($m[3])) {
+            $value = $m[3];
+        }
+        return html_entity_decode($value, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    }
+
+    /**
+     * Decodes the "window._IDK = {...}" object of the identity password page.
+     */
+    private function ParseIdk(string $html): ?array
+    {
+        if (!preg_match('/window\._IDK\s*=\s*(.*?)[;<]/s', $html, $m)) {
+            return null;
+        }
+        $json = str_replace("'", '"', $m[1]);
+        $json = (string)preg_replace('/\s(\w+):/', ' "$1":', $json);
+        $json = (string)preg_replace('/,\s+}/s', '}', $json);
+
+        $res = json_decode($json, true);
+        return is_array($res) ? $res : null;
+    }
+
+    /**
+     * Re-encodes the query of a url (callback urls may contain raw spaces).
+     */
+    private function NormalizeUrlQuery(string $url): string
+    {
+        $parts = parse_url($url);
+        if (!is_array($parts) || empty($parts['query'])) {
+            return $url;
+        }
+        parse_str($parts['query'], $query);
+        return ($parts['scheme'] ?? 'https') . '://' . ($parts['host'] ?? '') . (isset($parts['port']) ? ':' . $parts['port'] : '')
+            . ($parts['path'] ?? '') . '?' . http_build_query($query);
+    }
+
+    private function RandomString(int $length): string
+    {
+        $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+        $res = '';
+        for ($i = 0; $i < $length; $i++) {
+            $res .= $chars[random_int(0, strlen($chars) - 1)];
+        }
+        return $res;
+    }
+
+    /**
+     * Datasets with content, oldest first. While the vehicle is idle the portal emits
+     * "..._no_content_found.zip" placeholders; those are skipped.
+     */
+    private function ContentDatasets(array $list): array
+    {
+        $content = [];
+        foreach ($list as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+            $name = (string)($item['name'] ?? '');
+            if ($name === '' || stripos($name, 'no_content_found') !== false) {
+                continue;
+            }
+
+            $ts = 0;
+            if (!empty($item['createdOn'])) {
+                $t = strtotime((string)$item['createdOn']);
+                if ($t !== false) {
+                    $ts = $t;
+                }
+            }
+            if ($ts === 0) {
+                $ts = $this->StampFromName($name);
+            }
+            if ($ts === 0) {
+                $this->SendDebug('ContentDatasets', 'Überspringe Datensatz ohne Zeitangabe: ' . $name, 0);
+                continue;
+            }
+
+            $content[] = ['name' => $name, 'ts' => $ts];
         }
 
-        $this->SetStatus(102);
-        $this->SendDebug('DownloadAndImport', 'Gültiger Telemetrie-Export heruntergeladen: ' . $zipFilename . ' (' . filesize($zipPath) . ' Bytes)', 0);
+        usort($content, function ($a, $b) {
+            return $a['ts'] <=> $b['ts'];
+        });
 
-        // Process downloaded ZIP file
-        $this->ProcessZipFile($zipPath);
-        return true;
+        return $content;
+    }
+
+    /**
+     * Datasets that still need importing, oldest first. Without a previous import only the
+     * newest MAX_BACKFILL datasets are returned.
+     */
+    private function PendingDatasets(array $content, int $after): array
+    {
+        if ($after === 0) {
+            return array_slice($content, -self::MAX_BACKFILL);
+        }
+        return array_values(array_filter($content, function ($dataset) use ($after) {
+            return $dataset['ts'] > $after;
+        }));
+    }
+
+    /**
+     * Keeps only the newest KEEP_EXPORTS archives in the download folder.
+     */
+    private function PruneExports(string $dir): void
+    {
+        $files = glob($dir . DIRECTORY_SEPARATOR . '*.zip');
+        if (!is_array($files) || count($files) <= self::KEEP_EXPORTS) {
+            return;
+        }
+        usort($files, function ($a, $b) {
+            return $this->ExportSortKey($b) <=> $this->ExportSortKey($a);
+        });
+        foreach (array_slice($files, self::KEEP_EXPORTS) as $old) {
+            @unlink($old);
+        }
     }
 
     /**
@@ -344,39 +731,45 @@ class VWEUDataActTelemetry extends IPSModule
             return;
         }
 
-        $this->ProcessZipFile($actualZipFile);
+        $this->ProcessZipFile($actualZipFile, $this->StampFromName($actualZipFile));
     }
 
     /**
-     * Derive a sortable export timestamp from an export filename.
-     * Supports "20260721121617_VIN.zip" and "telemetry_20260721121617_VIN.zip".
-     * Falls back to filemtime when no timestamp is encoded.
+     * Delivery time encoded in an export filename, e.g. "20260721121617_VIN.zip".
+     * The portal writes this stamp in UTC. Returns 0 if the name carries no stamp.
      */
-    private function ExportSortKey(string $file): int
+    private function StampFromName(string $file): int
     {
-        if (preg_match('/(\d{14})/', basename($file), $m)) {
-            $t = strtotime(
-                substr($m[1], 0, 4) . '-' . substr($m[1], 4, 2) . '-' . substr($m[1], 6, 2) . ' ' .
-                substr($m[1], 8, 2) . ':' . substr($m[1], 10, 2) . ':' . substr($m[1], 12, 2)
-            );
-            if ($t !== false) {
+        if (preg_match('/(?<!\d)(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?!\d)/', basename($file), $m)) {
+            $t = gmmktime((int)$m[4], (int)$m[5], (int)$m[6], (int)$m[2], (int)$m[3], (int)$m[1]);
+            if ($t !== false && $t > 0) {
                 return $t;
             }
         }
-        return (int)@filemtime($file);
+        return 0;
     }
 
     /**
-     * Process a ZIP file (Memory Extraction & Variable Update)
+     * Sortable export time: the stamp in the filename, else filemtime.
      */
-    private function ProcessZipFile(string $actualZipFile)
+    private function ExportSortKey(string $file): int
+    {
+        $t = $this->StampFromName($file);
+        return $t > 0 ? $t : (int)@filemtime($file);
+    }
+
+    /**
+     * Process a ZIP file (Memory Extraction & Variable Update).
+     * $deliveredAt is the delivery time of the dataset, 0 if unknown.
+     */
+    private function ProcessZipFile(string $actualZipFile, int $deliveredAt = 0): bool
     {
         // Open ZIP archive in memory
         $zip = new ZipArchive();
         if ($zip->open($actualZipFile) !== true) {
             $this->SetStatus(202);
             $this->SendDebug('ProcessZipFile', 'ZIP-Archiv konnte nicht geöffnet werden: ' . $actualZipFile, 0);
-            return;
+            return false;
         }
 
         // Find telemetry JSON file inside ZIP archive
@@ -393,23 +786,26 @@ class VWEUDataActTelemetry extends IPSModule
         if (empty($jsonString)) {
             $this->SetStatus(202);
             $this->SendDebug('ProcessZipFile', 'Keine JSON-Datei im ZIP-Archiv enthalten.', 0);
-            return;
+            return false;
         }
 
         $payload = json_decode($jsonString, true);
         if (!$payload || !is_array($payload)) {
             $this->SetStatus(202);
             $this->SendDebug('ProcessZipFile', 'JSON-Payload konnte nicht dekodiert werden.', 0);
-            return;
+            return false;
         }
 
         $this->SetStatus(102);
 
         // Process telemetry payload
-        $this->ProcessPayload($payload);
+        if (!$this->ProcessPayload($payload, $deliveredAt)) {
+            return false;
+        }
 
         // Render HTML Tile Dashboard
         $this->RenderTileVisualization();
+        return true;
     }
 
     /**
@@ -584,25 +980,28 @@ class VWEUDataActTelemetry extends IPSModule
     }
 
     /**
-     * Map JSON data into IP-Symcon Status Variables
+     * Map JSON data into IP-Symcon Status Variables.
+     * Datasets can be partial: variables whose fields are missing keep their value.
      */
-    private function ProcessPayload(array $payload)
+    private function ProcessPayload(array $payload, int $deliveredAt = 0): bool
     {
-        $vin = $payload['vin'] ?? '';
+        $vin = (string)($payload['vin'] ?? '');
 
         // FIX: never overwrite this instance's variables with another vehicle's export.
         $wantVin = strtoupper(trim($this->ReadPropertyString('PortalVIN')));
-        if ($wantVin !== '' && $vin !== '' && strtoupper((string)$vin) !== $wantVin) {
+        if ($wantVin !== '' && $vin !== '' && strtoupper($vin) !== $wantVin) {
             $this->SendDebug('ProcessPayload', "Export gehoert zu VIN {$vin}, erwartet {$wantVin} - verworfen.", 0);
             $this->SetStatus(204);
-            return;
+            return false;
         }
 
-        $this->SetValue('VIN', (string)$vin);
+        if ($vin !== '') {
+            $this->SetValue('VIN', $vin);
+        }
 
         $dataItems = $payload['Data'] ?? [];
         if (!is_array($dataItems)) {
-            return;
+            return false;
         }
 
         // FIX: the export lists history, not only the current state. The same normalized
@@ -612,24 +1011,24 @@ class VWEUDataActTelemetry extends IPSModule
         $fieldMap = [];
         $rankMap  = [];
 
-        // A 'key' is only usable as an alias if it identifies exactly one data point.
-        $keyCount = [];
+        // A 'key' is only usable as an alias if every data point carrying it belongs to
+        // the same (normalized) field.
+        $keyFields = [];
         foreach ($dataItems as $item) {
-            if (isset($item['key'])) {
-                $k = $item['key'];
-                $keyCount[$k] = ($keyCount[$k] ?? 0) + 1;
+            if (is_array($item) && isset($item['key'], $item['dataFieldName'])) {
+                $keyFields[(string)$item['key']][preg_replace('/\[\d+\]/', '[*]', (string)$item['dataFieldName'])] = true;
             }
         }
 
         $newestDataTs = 0;
 
         foreach ($dataItems as $item) {
-            if (!isset($item['dataFieldName'])) {
+            if (!is_array($item) || !isset($item['dataFieldName'])) {
                 continue;
             }
-            $fn  = $item['dataFieldName'];
+            $fn  = (string)$item['dataFieldName'];
             $val = $item['value'] ?? null;
-            $key = $item['key'] ?? null;
+            $key = isset($item['key']) ? (string)$item['key'] : '';
 
             // Rank: real timestamp if present (the export uses 1970-epoch placeholders for
             // curve points), otherwise the largest array index inside the field name.
@@ -657,14 +1056,15 @@ class VWEUDataActTelemetry extends IPSModule
             $norm = preg_replace('/\[\d+\]/', '[*]', $fn);
             $this->RankedSet($fieldMap, $rankMap, $norm, $val, $rank);
 
-            if ($key && ($keyCount[$key] ?? 0) === 1) {
+            if ($key !== '' && count($keyFields[$key] ?? []) === 1) {
                 $this->RankedSet($fieldMap, $rankMap, $key, $val, $rank);
             }
         }
 
-        // FIX: LastUpdate used to be time(), so stale imports still looked fresh.
-        // Report the age of the DATA, not the moment of the import.
-        $this->SetValue('LastUpdate', $newestDataTs > 0 ? $newestDataTs : time());
+        // LastUpdate reports the age of the DATA, not the moment of the import: the delivery
+        // time of the dataset if known (timestampUtc is unreliable across datasets), else
+        // the newest plausible data stamp.
+        $this->SetValue('LastUpdate', $deliveredAt > 0 ? $deliveredAt : ($newestDataTs > 0 ? $newestDataTs : time()));
 
         // System / Metadata
         $isConnected = $fieldMap['isConnected'] ?? null;
@@ -674,7 +1074,7 @@ class VWEUDataActTelemetry extends IPSModule
 
         // Cluster 1: Hochvolt-Akku & PV-Laden
         if ($this->ReadPropertyBoolean('EnableHVBattery')) {
-            $soc = $this->ExtractFloat($fieldMap, ['hvsoc_info.value', 'batteryStatus.currentSOC_pct', 'battery_state_report.soc', 'hv_soc', 'state_of_charge']);
+            $soc = $this->ExtractFloat($fieldMap, ['hvsoc_info.value', 'batteryStatus.currentSOC_pct', 'battery_state_report.soc', 'hv_soc', 'state_of_charge', 'battery_level_HV.value', '506cb83e-f99f-3af3-bbeb-0429b69a78d9', '0a18a053-b4b0-3db1-be44-a6c5dba629b1']);
             if ($soc !== null) {
                 $this->SetValue('HVSOC', $soc);
             }
@@ -694,8 +1094,8 @@ class VWEUDataActTelemetry extends IPSModule
                 $this->SetValue('ChargeRateKmph', $chargeRate);
             }
 
-            $remChargeTime = $this->ExtractFloat($fieldMap, ['remaining_charging_time_complete', 'ChargingEvent.[*].ChargingStatus.[*].remainingChargingTimeToCompleteMin']);
-            if ($remChargeTime !== null) {
+            $remChargeTime = $this->ExtractFloat($fieldMap, ['remaining_charging_time_complete', 'ChargingEvent.[*].ChargingStatus.[*].remainingChargingTimeToCompleteMin', 'remaining_charging_time']);
+            if ($remChargeTime !== null && $remChargeTime < 65535) {
                 $this->SetValue('RemainingChargeTimeMin', $remChargeTime);
             }
 
@@ -709,7 +1109,7 @@ class VWEUDataActTelemetry extends IPSModule
                 $this->SetValue('ChargeMode', (string)$chargeMode);
             }
 
-            $chargeState = $fieldMap['chargingStatus.currentChargeState'] ?? '';
+            $chargeState = $fieldMap['chargingStatus.currentChargeState'] ?? $fieldMap['charging_state_report.current_charge_state'] ?? '';
             if (!empty($chargeState)) {
                 $this->SetValue('ChargeState', (string)$chargeState);
             }
@@ -729,7 +1129,7 @@ class VWEUDataActTelemetry extends IPSModule
                 $this->SetValue('MaxCurrentL3', $maxL3);
             }
 
-            $plugState = $fieldMap['plugStatusItem.plugConnectionState'] ?? '';
+            $plugState = $fieldMap['plugStatusItem.plugConnectionState'] ?? $fieldMap['plug_state'] ?? '';
             if (!empty($plugState)) {
                 $this->SetValue('PlugConnectionState', (string)$plugState);
             }
@@ -785,28 +1185,45 @@ class VWEUDataActTelemetry extends IPSModule
 
         // Cluster 3: Sicherheit & Fahrzeugstatus
         if ($this->ReadPropertyBoolean('EnableSecurity')) {
-            $this->SetValue('DoorLockFL', ($fieldMap['door_info.front_left.door_lock_status.value'] ?? '') === 'LOCKED');
-            $this->SetValue('DoorStatusFL', ($fieldMap['door_info.front_left.door_status.value'] ?? '') === 'OPEN');
-            $this->SetValue('DoorLockFR', ($fieldMap['door_info.front_right.door_lock_status.value'] ?? '') === 'LOCKED');
-            $this->SetValue('DoorStatusFR', ($fieldMap['door_info.front_right.door_status.value'] ?? '') === 'OPEN');
-            $this->SetValue('DoorLockRL', ($fieldMap['door_info.rear_left.door_lock_status.value'] ?? '') === 'LOCKED');
-            $this->SetValue('DoorStatusRL', ($fieldMap['door_info.rear_left.door_status.value'] ?? '') === 'OPEN');
-            $this->SetValue('DoorLockRR', ($fieldMap['door_info.rear_right.door_lock_status.value'] ?? '') === 'LOCKED');
-            $this->SetValue('DoorStatusRR', ($fieldMap['door_info.rear_right.door_status.value'] ?? '') === 'OPEN');
+            // Only touch variables whose field is part of this (possibly partial) dataset.
+            $flags = [
+                'DoorLockFL'   => ['door_info.front_left.door_lock_status.value', 'LOCKED'],
+                'DoorStatusFL' => ['door_info.front_left.door_status.value', 'OPEN'],
+                'DoorLockFR'   => ['door_info.front_right.door_lock_status.value', 'LOCKED'],
+                'DoorStatusFR' => ['door_info.front_right.door_status.value', 'OPEN'],
+                'DoorLockRL'   => ['door_info.rear_left.door_lock_status.value', 'LOCKED'],
+                'DoorStatusRL' => ['door_info.rear_left.door_status.value', 'OPEN'],
+                'DoorLockRR'   => ['door_info.rear_right.door_lock_status.value', 'LOCKED'],
+                'DoorStatusRR' => ['door_info.rear_right.door_status.value', 'OPEN'],
+                'TrunkLock'    => ['trunk_lid_info.trunk_lid_lock_status.value', 'LOCKED'],
+                'TrunkStatus'  => ['trunk_lid_info.trunk_lid_status.value', 'OPEN'],
+                'HoodLock'     => ['hood_info.hood_lock_status.value', 'LOCKED'],
+                'HoodStatus'   => ['hood_info.hood_status.value', 'OPEN']
+            ];
+            foreach ($flags as $ident => [$field, $match]) {
+                if (isset($fieldMap[$field])) {
+                    $this->SetValue($ident, $fieldMap[$field] === $match);
+                }
+            }
 
-            $this->SetValue('TrunkLock', ($fieldMap['trunk_lid_info.trunk_lid_lock_status.value'] ?? '') === 'LOCKED');
-            $this->SetValue('TrunkStatus', ($fieldMap['trunk_lid_info.trunk_lid_status.value'] ?? '') === 'OPEN');
-            $this->SetValue('HoodLock', ($fieldMap['hood_info.hood_lock_status.value'] ?? '') === 'LOCKED');
-            $this->SetValue('HoodStatus', ($fieldMap['hood_info.hood_status.value'] ?? '') === 'OPEN');
+            $windows = [
+                'WindowOpenFL' => 'window_info.front_left.window_percentage_open.value',
+                'WindowOpenFR' => 'window_info.front_right.window_percentage_open.value',
+                'WindowOpenRL' => 'window_info.rear_left.window_percentage_open.value',
+                'WindowOpenRR' => 'window_info.rear_right.window_percentage_open.value'
+            ];
+            foreach ($windows as $ident => $field) {
+                $open = $this->ExtractFloat($fieldMap, [$field]);
+                if ($open !== null) {
+                    $this->SetValue($ident, $open);
+                }
+            }
 
-            $this->SetValue('WindowOpenFL', (float)($fieldMap['window_info.front_left.window_percentage_open.value'] ?? 0));
-            $this->SetValue('WindowOpenFR', (float)($fieldMap['window_info.front_right.window_percentage_open.value'] ?? 0));
-            $this->SetValue('WindowOpenRL', (float)($fieldMap['window_info.rear_left.window_percentage_open.value'] ?? 0));
-            $this->SetValue('WindowOpenRR', (float)($fieldMap['window_info.rear_right.window_percentage_open.value'] ?? 0));
-
-            $parkingLeft = $fieldMap['parking_lights_info.left_status.value'] ?? 'OFF';
-            $parkingRight = $fieldMap['parking_lights_info.right_status.value'] ?? 'OFF';
-            $this->SetValue('ParkingLights', $parkingLeft !== 'OFF' || $parkingRight !== 'OFF');
+            if (isset($fieldMap['parking_lights_info.left_status.value']) || isset($fieldMap['parking_lights_info.right_status.value'])) {
+                $parkingLeft = $fieldMap['parking_lights_info.left_status.value'] ?? 'OFF';
+                $parkingRight = $fieldMap['parking_lights_info.right_status.value'] ?? 'OFF';
+                $this->SetValue('ParkingLights', $parkingLeft !== 'OFF' || $parkingRight !== 'OFF');
+            }
         }
 
         // Cluster 4: Reifendruck & Sensorik
@@ -863,8 +1280,9 @@ class VWEUDataActTelemetry extends IPSModule
                 $this->SetValue('CabinTemp', $tCabin);
             }
 
-            $winHeat = $fieldMap['envelope.[*].report.windowHeatingState'] ?? 'OFF';
-            $this->SetValue('WindowHeating', $winHeat !== 'OFF');
+            if (isset($fieldMap['envelope.[*].report.windowHeatingState'])) {
+                $this->SetValue('WindowHeating', $fieldMap['envelope.[*].report.windowHeatingState'] !== 'OFF');
+            }
 
             $remClimaSec = $this->ExtractFloat($fieldMap, ['envelope.[*].report.remainingClimatizationTime_min.seconds', 'remaining_climatisation_time']);
             if ($remClimaSec !== null) {
@@ -884,12 +1302,12 @@ class VWEUDataActTelemetry extends IPSModule
 
         // Cluster 6: Laufleistung, Wartung & Systemzustand
         if ($this->ReadPropertyBoolean('EnableService')) {
-            $mileage = $this->ExtractFloat($fieldMap, ['mileage_info.value', 'inventoryData.[*].odometer', 'mileage']);
+            $mileage = $this->ExtractFloat($fieldMap, ['mileage_info.value', 'inventoryData.[*].odometer', 'mileage', 'mileage.value']);
             if ($mileage !== null) {
                 $this->SetValue('MileageKm', $mileage);
             }
 
-            $range = $this->ExtractFloat($fieldMap, ['cruise_range_primary_info.value', 'cruising_range_combined', 'batteryStatus.cruisingRange.range']);
+            $range = $this->ExtractFloat($fieldMap, ['cruise_range_primary_info.value', 'cruising_range_combined', 'batteryStatus.cruisingRange.range', 'cruising_range_secondary_engine', 'cruising_range_primary_engine', '0ca40e18-0564-3eda-bcc0-7aee9ef44f04']);
             if ($range !== null) {
                 $this->SetValue('CruisingRangeKm', $range);
             }
@@ -899,17 +1317,18 @@ class VWEUDataActTelemetry extends IPSModule
                 $this->SetValue('ServiceInspectionDays', $serviceDays);
             }
 
-            $errDesc = $fieldMap['vehicleError.errorDescription'] ?? '';
-            $this->SetValue('VehicleErrorDescription', (string)$errDesc);
+            if (array_key_exists('vehicleError.errorDescription', $fieldMap)) {
+                $this->SetValue('VehicleErrorDescription', (string)$fieldMap['vehicleError.errorDescription']);
+            }
 
-            $errNum = (int)($fieldMap['vehicleError.errorNumber'] ?? 0);
-            $this->SetValue('VehicleErrorNumber', $errNum);
+            if (array_key_exists('vehicleError.errorNumber', $fieldMap)) {
+                $this->SetValue('VehicleErrorNumber', (int)$fieldMap['vehicleError.errorNumber']);
+            }
         }
+
+        return true;
     }
 
-    /**
-     * Helper to extract numeric value from candidate field names
-     */
     /**
      * Store a value only if it ranks at least as high (newer / higher index)
      * as whatever is already stored under that name.
@@ -922,6 +1341,9 @@ class VWEUDataActTelemetry extends IPSModule
         }
     }
 
+    /**
+     * Helper to extract numeric value from candidate field names
+     */
     private function ExtractFloat(array $fieldMap, array $candidates): ?float
     {
         foreach ($candidates as $cand) {

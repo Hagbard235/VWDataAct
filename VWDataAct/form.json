@@ -25,6 +25,33 @@
             "caption": "VW EU Data Act Portal Zugangsdaten (für Portal Download)",
             "items": [
                 {
+                    "type": "Select",
+                    "name": "PortalBrand",
+                    "caption": "Marke",
+                    "options": [
+                        {
+                            "caption": "Volkswagen",
+                            "value": "Volkswagen"
+                        },
+                        {
+                            "caption": "Audi",
+                            "value": "Audi"
+                        },
+                        {
+                            "caption": "Škoda",
+                            "value": "Skoda"
+                        },
+                        {
+                            "caption": "SEAT",
+                            "value": "Seat"
+                        },
+                        {
+                            "caption": "CUPRA",
+                            "value": "Cupra"
+                        }
+                    ]
+                },
+                {
                     "type": "ValidationTextBox",
                     "name": "PortalUsername",
                     "caption": "E-Mail (VW ID / myAudi / Cupra / SEAT ID)"
@@ -37,7 +64,7 @@
                 {
                     "type": "ValidationTextBox",
                     "name": "PortalVIN",
-                    "caption": "Fahrzeug-ID (VIN / FIN)"
+                    "caption": "Fahrzeug-ID (VIN / FIN, leer = einziges Fahrzeug im Portal)"
                 }
             ]
         },
@@ -94,6 +121,11 @@
         },
         {
             "type": "Button",
+            "caption": "Portal-Datensätze neu einlesen (neueste 8)",
+            "onClick": "VWDA_ResetPortalState($id); VWDA_DownloadAndImport($id);"
+        },
+        {
+            "type": "Button",
             "caption": "Lokale Daten Importieren & Aktualisieren",
             "onClick": "VWDA_UpdateData($id);"
         },
@@ -112,7 +144,7 @@
         {
             "code": 201,
             "icon": "error",
-            "caption": "Dateipfad oder Portal-Zugangsdaten nicht angegeben."
+            "caption": "Dateipfad, Portal-Zugangsdaten, Marke oder VIN nicht angegeben."
         },
         {
             "code": 202,
@@ -128,6 +160,16 @@
             "code": 204,
             "icon": "error",
             "caption": "Export gehört zu einer anderen VIN – Import verworfen."
+        },
+        {
+            "code": 205,
+            "icon": "error",
+            "caption": "Im Portal ist kein Fahrzeug bzw. keine Datenanfrage eingerichtet."
+        },
+        {
+            "code": 206,
+            "icon": "error",
+            "caption": "Unerwartete Antwort des Portals."
         }
     ]
 }
