@@ -29,6 +29,16 @@ class VWEUDataActTelemetry extends IPSModule
     // Seconds the timer pauses after a failed login, so VW does not lock the account
     private const LOGIN_RETRY_DELAY = 3600;
 
+    // Fields carrying the time the vehicle captured the data. The portal re-delivers old
+    // reports, so its delivery time can be hours newer than the data itself.
+    private const CAPTURE_FIELDS = [
+        'car_captured_utc_timestamp',
+        'car_captured_time',
+        'instrument_cluster_time',
+        'profile_state_report.car_captured_time',
+        'profile_state_report.instrument_cluster_time'
+    ];
+
     public function Create()
     {
         // Always call parent first
@@ -1246,6 +1256,7 @@ class VWEUDataActTelemetry extends IPSModule
         }
 
         $newestDataTs = 0;
+        $newestCaptureTs = 0;
 
         foreach ($dataItems as $item) {
             if (!is_array($item) || !isset($item['dataFieldName'])) {
@@ -1254,6 +1265,11 @@ class VWEUDataActTelemetry extends IPSModule
             $fn  = (string)$item['dataFieldName'];
             $val = $item['value'] ?? null;
             $key = isset($item['key']) ? (string)$item['key'] : '';
+
+            // newest time the vehicle captured data in this dataset
+            if (is_scalar($val) && in_array($fn, self::CAPTURE_FIELDS, true)) {
+                $newestCaptureTs = max($newestCaptureTs, $this->ParseTimestamp((string)$val));
+            }
 
             // Rank: real timestamp if present (the export uses 1970-epoch placeholders for
             // curve points), otherwise the largest array index inside the field name.
@@ -1286,10 +1302,14 @@ class VWEUDataActTelemetry extends IPSModule
             }
         }
 
-        // LastUpdate reports the age of the DATA, not the moment of the import: the delivery
-        // time of the dataset if known (timestampUtc is unreliable across datasets), else
-        // the newest plausible data stamp.
-        $this->SetValue('LastUpdate', $deliveredAt > 0 ? $deliveredAt : ($newestDataTs > 0 ? $newestDataTs : time()));
+        // LastUpdate reports the age of the DATA, not the moment of the import: the newest
+        // time the vehicle captured data, else the portal's delivery time (the one-time full
+        // export carries no capture time), else the newest plausible data stamp.
+        $lastUpdate = $newestCaptureTs;
+        if ($lastUpdate === 0) {
+            $lastUpdate = $deliveredAt > 0 ? $deliveredAt : ($newestDataTs > 0 ? $newestDataTs : time());
+        }
+        $this->SetValue('LastUpdate', $lastUpdate);
 
         // System / Metadata
         $isConnected = $fieldMap['isConnected'] ?? null;
@@ -1665,6 +1685,31 @@ class VWEUDataActTelemetry extends IPSModule
             }
         }
         return null;
+    }
+
+    /**
+     * Timestamp from an ISO date ("2026-09-11T18:12:03.000+02:00") or an epoch value in
+     * seconds or milliseconds. Returns 0 for anything unparsable or implausible.
+     */
+    private function ParseTimestamp(string $raw): int
+    {
+        $raw = trim($raw);
+        if ($raw === '') {
+            return 0;
+        }
+        if (ctype_digit($raw)) {
+            $value = (float)$raw;
+            if ($value > 100000000000) {
+                $value /= 1000.0; // milliseconds
+            }
+            $t = (int)$value;
+        } else {
+            $t = strtotime($raw);
+            if ($t === false) {
+                return 0;
+            }
+        }
+        return ($t > 1420070400 && $t < time() + 86400) ? $t : 0;
     }
 
     /**
