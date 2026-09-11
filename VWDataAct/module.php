@@ -1315,11 +1315,26 @@ class VWEUDataActTelemetry extends IPSModule
             }
 
             $chargeRate = $this->ExtractFloat($fieldMap, ['chargeRateKmph', 'ChargingEvent.[*].ChargingStatus.[*].chargeRateKmph']);
+            if ($chargeRate === null) {
+                // continuous data: rate plus unit enum (CHARGE_RATE_UNIT_KM_PER_H ... _MILES_PER_MIN)
+                $chargeRate = $this->ExtractFloat($fieldMap, ['battery_state_report.charge_rate']);
+                $rateUnit = strtoupper((string)($fieldMap['battery_state_report.charge_rate_unit'] ?? ''));
+                if ($chargeRate !== null) {
+                    $chargeRate *= (strpos($rateUnit, 'MILES') !== false ? 1.609344 : 1.0) * (strpos($rateUnit, 'PER_MIN') !== false ? 60.0 : 1.0);
+                }
+            }
             if ($chargeRate !== null) {
                 $this->SetValue('ChargeRateKmph', $chargeRate);
             }
 
             $remChargeTime = $this->ExtractFloat($fieldMap, ['remaining_charging_time_complete', 'ChargingEvent.[*].ChargingStatus.[*].remainingChargingTimeToCompleteMin', 'remaining_charging_time']);
+            if ($remChargeTime === null) {
+                // continuous data: duration in seconds ("158700s"), only meaningful while charging
+                $remSeconds = $this->ExtractSeconds($fieldMap, ['battery_state_report.remaining_charging_time_complete']);
+                if ($remSeconds !== null) {
+                    $remChargeTime = $this->IsCharging($fieldMap) === false ? 0.0 : round($remSeconds / 60.0);
+                }
+            }
             if ($remChargeTime !== null && $remChargeTime < 65535) {
                 $this->SetValue('RemainingChargeTimeMin', $remChargeTime);
             }
@@ -1329,7 +1344,7 @@ class VWEUDataActTelemetry extends IPSModule
                 $this->SetValue('TotalChargedEnergyKWh', $totalEnergy);
             }
 
-            $chargeMode = $fieldMap['chargingStatus.chargeMode'] ?? $fieldMap['chargeModeSelection'] ?? '';
+            $chargeMode = $fieldMap['chargingStatus.chargeMode'] ?? $fieldMap['chargeModeSelection'] ?? $fieldMap['charging_state_report.charge_mode'] ?? $fieldMap['settings.charge_mode_selection'] ?? '';
             if (!empty($chargeMode)) {
                 $this->SetValue('ChargeMode', (string)$chargeMode);
             }
@@ -1397,12 +1412,12 @@ class VWEUDataActTelemetry extends IPSModule
                 $this->SetValue('HVCellDrift', $driftMv);
             }
 
-            $tHvMax = $this->ExtractFloat($fieldMap, ['hvbatterytemperature_info.max_temperature.value', 'hvbatterytemperature.max_temperature']);
+            $tHvMax = $this->ExtractFloat($fieldMap, ['hvbatterytemperature_info.max_temperature.value', 'hvbatterytemperature.max_temperature', 'dc4a4716-2205-352f-802f-8d7d59705c5b']);
             if ($tHvMax !== null) {
                 $this->SetValue('HVBatteryTempMax', $tHvMax);
             }
 
-            $tHvMin = $this->ExtractFloat($fieldMap, ['hvbatterytemperature_info.min_temperature.value', 'hvbatterytemperature.min_temperature']);
+            $tHvMin = $this->ExtractFloat($fieldMap, ['hvbatterytemperature_info.min_temperature.value', 'hvbatterytemperature.min_temperature', '374014c4-2fd5-3d73-ac75-7c949e726f00']);
             if ($tHvMin !== null) {
                 $this->SetValue('HVBatteryTempMin', $tHvMin);
             }
@@ -1448,6 +1463,13 @@ class VWEUDataActTelemetry extends IPSModule
                 $parkingLeft = $fieldMap['parking_lights_info.left_status.value'] ?? 'OFF';
                 $parkingRight = $fieldMap['parking_lights_info.right_status.value'] ?? 'OFF';
                 $this->SetValue('ParkingLights', $parkingLeft !== 'OFF' || $parkingRight !== 'OFF');
+            }
+
+            // continuous data: one boolean per side
+            if (isset($fieldMap['parking_light_left']) || isset($fieldMap['parking_light_right'])) {
+                $parkingLeft = filter_var($fieldMap['parking_light_left'] ?? false, FILTER_VALIDATE_BOOLEAN);
+                $parkingRight = filter_var($fieldMap['parking_light_right'] ?? false, FILTER_VALIDATE_BOOLEAN);
+                $this->SetValue('ParkingLights', $parkingLeft || $parkingRight);
             }
         }
 
@@ -1505,11 +1527,13 @@ class VWEUDataActTelemetry extends IPSModule
                 $this->SetValue('CabinTemp', $tCabin);
             }
 
-            if (isset($fieldMap['envelope.[*].report.windowHeatingState'])) {
-                $this->SetValue('WindowHeating', $fieldMap['envelope.[*].report.windowHeatingState'] !== 'OFF');
+            // "OFF" or, in the continuous data, "WINDOW_HEATING_STATE_OFF"; INVALID says nothing
+            $windowHeating = $fieldMap['envelope.[*].report.windowHeatingState'] ?? $fieldMap['window_heating_state'] ?? null;
+            if (is_scalar($windowHeating) && stripos((string)$windowHeating, 'INVALID') === false) {
+                $this->SetValue('WindowHeating', !preg_match('/(^|_)OFF$/i', (string)$windowHeating));
             }
 
-            $remClimaSec = $this->ExtractFloat($fieldMap, ['envelope.[*].report.remainingClimatizationTime_min.seconds', 'remaining_climatisation_time']);
+            $remClimaSec = $this->ExtractSeconds($fieldMap, ['envelope.[*].report.remainingClimatizationTime_min.seconds', 'remaining_climatisation_time', 'remaining_climate_time']);
             if ($remClimaSec !== null) {
                 $this->SetValue('RemainingClimatisationMin', round($remClimaSec / 60.0, 1));
             }
@@ -1603,6 +1627,44 @@ class VWEUDataActTelemetry extends IPSModule
         }
 
         return $notReady ? 'DISCONNECTED' : null;
+    }
+
+    /**
+     * True while the HV battery is being charged, false for any other known charge state,
+     * null if the dataset carries no charge state.
+     */
+    private function IsCharging(array $fieldMap): ?bool
+    {
+        foreach (['charging_state_report.current_charge_state', 'chargingStatus.currentChargeState', 'charging_state'] as $field) {
+            if (!is_scalar($fieldMap[$field] ?? null)) {
+                continue;
+            }
+            $state = strtoupper((string)preg_replace('/[^a-zA-Z]/', '', (string)$fieldMap[$field]));
+            return strpos($state, 'CHARGINGHVBATTERY') !== false
+                || (strpos($state, 'CONSERVATIONCHARGING') !== false && strpos($state, 'NOTCONSERVATIONCHARGING') === false)
+                || $state === 'CHARGING';
+        }
+        return null;
+    }
+
+    /**
+     * Number or duration in seconds ("1800s") from candidate field names. Sentinels the
+     * portal uses for "no reading" (-1, 65535, 2147483647, 4294967295) are skipped.
+     */
+    private function ExtractSeconds(array $fieldMap, array $candidates): ?float
+    {
+        foreach ($candidates as $cand) {
+            if (!is_scalar($fieldMap[$cand] ?? null)) {
+                continue;
+            }
+            if (preg_match('/^(-?\d+(?:\.\d+)?)\s*s?$/i', trim((string)$fieldMap[$cand]), $m)) {
+                $value = (float)$m[1];
+                if (!in_array($value, [-1.0, 65535.0, 2147483647.0, 4294967295.0], true)) {
+                    return $value;
+                }
+            }
+        }
+        return null;
     }
 
     /**
