@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 class VWEUDataActTelemetry extends IPSModule
 {
-    // EU Data Act portal and VW group identity service. The portal flow is ported from
-    // evcc (vehicle/vw/eudataact), which is based on ioBroker.vw-connect (lib/euDataAct.js).
+    // EU Data Act portal and VW group identity service. The portal flow follows evcc
+    // (vehicle/vw/eudataact) and ioBroker.vw-connect (lib/euDataAct.js).
     private const PORTAL_BASE = 'https://eu-data-act.drivesomethinggreater.com';
     private const PORTAL_HOST = 'eu-data-act.drivesomethinggreater.com';
     private const IDENTITY_BASE = 'https://identity.vwgroup.io';
@@ -26,6 +26,9 @@ class VWEUDataActTelemetry extends IPSModule
     // Number of downloaded datasets kept in user/vwdataact_exports
     private const KEEP_EXPORTS = 50;
 
+    // Seconds the timer pauses after a failed login, so VW does not lock the account
+    private const LOGIN_RETRY_DELAY = 3600;
+
     public function Create()
     {
         // Always call parent first
@@ -40,9 +43,11 @@ class VWEUDataActTelemetry extends IPSModule
         $this->RegisterPropertyString('PortalBrand', 'Volkswagen');
         $this->RegisterPropertyInteger('PollInterval', 15);
 
-        // Portal import state: delivery time and VIN of the newest imported dataset
+        // Portal import state: delivery time and VIN of the newest imported dataset,
+        // time of the last failed login
         $this->RegisterAttributeInteger('LastDatasetCreatedOn', 0);
         $this->RegisterAttributeString('LastDatasetVIN', '');
+        $this->RegisterAttributeInteger('LoginFailedAt', 0);
 
         // Feature Toggles
         $this->RegisterPropertyBoolean('EnableHVBattery', true);
@@ -234,6 +239,10 @@ class VWEUDataActTelemetry extends IPSModule
             return $imported === count($pending);
         } catch (Exception $e) {
             $code = $e->getCode();
+            if ($code === 203) {
+                // pause automatic runs so repeated failed logins cannot lock the VW account
+                $this->WriteAttributeInteger('LoginFailedAt', time());
+            }
             $this->SetStatus(in_array($code, [201, 202, 203, 205, 206], true) ? $code : 206);
             $this->SendDebug('DownloadAndImport', 'FEHLER: ' . $e->getMessage(), 0);
             $this->LogMessage('VWDataAct: ' . $e->getMessage(), KL_ERROR);
@@ -335,7 +344,8 @@ class VWEUDataActTelemetry extends IPSModule
     }
 
     /**
-     * True if the portal answered with a login redirect or page instead of data.
+     * True if the portal answered with a login redirect or page instead of data. An expired
+     * session also shows up as HTTP 5xx with an HTML error page (Adobe AEM).
      */
     private function PortalNeedsLogin(array $res): bool
     {
@@ -346,7 +356,8 @@ class VWEUDataActTelemetry extends IPSModule
         if ($host !== '' && $host !== self::PORTAL_HOST) {
             return true;
         }
-        return $res['code'] === 200 && strncmp(ltrim($res['body']), '<', 1) === 0;
+        $html = strncmp(ltrim($res['body']), '<', 1) === 0;
+        return $html && ($res['code'] === 200 || $res['code'] >= 500);
     }
 
     /**
@@ -366,7 +377,7 @@ class VWEUDataActTelemetry extends IPSModule
             throw new Exception('Portal nicht erreichbar: ' . $res['error'], 202);
         }
         if ($this->PortalNeedsLogin($res)) {
-            throw new Exception('Das Portal verweigert den Zugriff trotz Anmeldung (HTTP ' . $res['code'] . ', ' . explode('?', $res['url'], 2)[0] . ').', 203);
+            throw new Exception('Das Portal verweigert den Zugriff trotz Anmeldung (HTTP ' . $res['code'] . ', ' . $this->UrlWithoutQuery($res['url']) . ').', 203);
         }
         return $res;
     }
@@ -382,10 +393,12 @@ class VWEUDataActTelemetry extends IPSModule
         // start with a fresh session
         curl_setopt($ch, CURLOPT_COOKIELIST, 'ALL');
 
-        // prime the portal session (best effort)
+        // prime the portal session (best effort), it sets cookies the login callback needs
         $this->PortalRequest($ch, 'GET', self::PORTAL_BASE . '/');
 
-        $query = http_build_query([
+        // the portal's own redirect servlet fails for non-browser clients, so the
+        // authorize url is built directly
+        $authorizeQuery = http_build_query([
             'client_id'     => $clientId,
             'response_type' => 'code',
             'scope'         => 'openid cars profile',
@@ -394,93 +407,80 @@ class VWEUDataActTelemetry extends IPSModule
             'prompt'        => 'login',
             'nonce'         => $this->RandomString(43)
         ]);
-        $res = $this->PortalRequest($ch, 'GET', self::IDENTITY_BASE . '/oidc/v1/authorize?' . $query);
-        if ($res['error'] !== '' || $res['code'] >= 400) {
-            throw new Exception('Login-Seite nicht erreichbar (HTTP ' . $res['code'] . ') ' . $res['error'], 203);
+        $signin = $this->PortalRequest($ch, 'GET', self::IDENTITY_BASE . '/oidc/v1/authorize?' . $authorizeQuery);
+        $this->SendDebug('PortalLogin', 'Login-Seite: HTTP ' . $signin['code'] . ', ' . $this->UrlWithoutQuery($signin['url']), 0);
+        if ($signin['error'] !== '' || $signin['code'] !== 200) {
+            throw new Exception('Login-Seite nicht erreichbar (HTTP ' . $signin['code'] . ') ' . $signin['error'], 203);
         }
 
-        $form = $this->ParseHtmlForm($res['body'], 'emailPasswordForm');
-        if ($form !== null) {
-            $res = $this->PortalLoginLegacy($ch, $form, $session['user'], $session['password']);
+        $login = $this->LoginFields($signin['body']);
+        if (!empty($login['fields']['hmac']) && !empty($login['fields']['_csrf'])) {
+            $landing = $this->PortalLoginLegacy($ch, $signin, $login, $session['user'], $session['password']);
         } else {
-            $res = $this->PortalLoginNew($ch, $res['body'], $session['user'], $session['password']);
+            $this->SendDebug('PortalLogin', 'Kein E-Mail/Passwort-Formular (hmac/_csrf fehlen) - versuche neuen Login-Ablauf.', 0);
+            $landing = $this->PortalLoginNew($ch, $signin['body'], $session['user'], $session['password']);
         }
 
-        $final = $res['url'];
+        $landing = $this->SkipMarketingConsent($ch, $landing);
+
+        $final = $landing['url'];
         $path = (string)parse_url($final, PHP_URL_PATH);
+        $this->SendDebug('PortalLogin', 'Zielseite: HTTP ' . $landing['code'] . ', ' . $this->UrlWithoutQuery($final), 0);
 
-        // VW periodically interjects an optional marketing consent page after an otherwise
-        // successful login. Skip it without consenting.
-        if (strpos($path, '/consent/marketing/') !== false) {
-            parse_str((string)parse_url($final, PHP_URL_QUERY), $query);
-            $callback = is_string($query['callback'] ?? null) ? $query['callback'] : '';
-            if ($callback === '') {
-                throw new Exception('Marketing-Einwilligung ohne Callback-URL - bitte einmal im Browser im Portal anmelden.', 203);
-            }
-            $this->SendDebug('PortalLogin', 'Überspringe Marketing-Einwilligung (ohne Zustimmung).', 0);
-            $res = $this->PortalRequest($ch, 'GET', $this->NormalizeUrlQuery($callback));
-            $final = $res['url'];
-            $path = (string)parse_url($final, PHP_URL_PATH);
+        // consent screen: the password was correct, but the portal was never authorised in a browser
+        if (stripos($path, '/signin-service/v1/consent/') !== false || stripos($landing['body'], 'consent-screen') !== false) {
+            throw new Exception('Das EU-Data-Act-Portal ist für dieses VW-Konto noch nicht freigegeben: einmal im Browser auf ' . self::PORTAL_BASE . ' anmelden und auf der VW-Einwilligungsseite zustimmen.', 203);
         }
-
-        // A successful login lands on the portal; a remaining signin/consent page means a
-        // wrong password or a consent that has to be confirmed once in the browser.
-        if (strpos($path, 'signin-service') !== false || strpos($path, '/consent') !== false || strpos($path, '/error') !== false) {
+        if (strpos($final, 'signin-service') !== false || strpos($path, '/error') !== false) {
             parse_str((string)parse_url($final, PHP_URL_QUERY), $query);
-            $reason = is_string($query['error'] ?? null) ? ' (' . $query['error'] . ')' : '';
-            throw new Exception('Anmeldung nicht abgeschlossen' . $reason . ' - Passwort prüfen bzw. im Browser im Portal anmelden und Einwilligung bestätigen: ' . explode('?', $final, 2)[0], 203);
+            $code = is_string($query['error'] ?? null) ? $query['error'] : $this->LoginErrorText($this->ExtractTemplateModel($landing['body']) ?? []);
+            if ($code !== '') {
+                throw new Exception('Anmeldung fehlgeschlagen: ' . $this->DescribeLoginError($code) . ' (' . $code . ').', 203);
+            }
+            throw new Exception('Anmeldung fehlgeschlagen ohne Fehlercode (HTTP ' . $landing['code'] . ', Zielseite ' . $this->UrlWithoutQuery($final) . ').', 203);
         }
         if ((string)parse_url($final, PHP_URL_HOST) !== self::PORTAL_HOST) {
-            throw new Exception('Anmeldung nicht abgeschlossen, unerwartete Zielseite: ' . explode('?', $final, 2)[0], 203);
+            throw new Exception('Anmeldung nicht abgeschlossen, unerwartete Zielseite: ' . $this->UrlWithoutQuery($final), 203);
         }
 
+        $this->WriteAttributeInteger('LoginFailedAt', 0);
         $this->SendDebug('PortalLogin', 'Anmeldung erfolgreich.', 0);
     }
 
     /**
-     * Identity login with separate email and password pages.
+     * Identity login with separate email and password pages (as ioBroker.vw-connect).
      */
-    private function PortalLoginLegacy($ch, array $form, string $user, string $password): array
+    private function PortalLoginLegacy($ch, array $signin, array $login, string $user, string $password): array
     {
-        // email / identifier step
-        $uri = strpos($form['action'], 'https://') === 0 ? $form['action'] : self::IDENTITY_BASE . $form['action'];
-        $res = $this->PortalRequest($ch, 'POST', $uri, [], [
-            '_csrf'      => $form['inputs']['_csrf'] ?? '',
-            'relayState' => $form['inputs']['relayState'] ?? '',
-            'hmac'       => $form['inputs']['hmac'] ?? '',
-            'email'      => $user
-        ]);
-        if ($res['error'] !== '' || $res['code'] >= 400) {
-            throw new Exception('Anmeldung: E-Mail-Schritt fehlgeschlagen (HTTP ' . $res['code'] . ') ' . $res['error'], 203);
+        // email / identifier step: form inputs plus hmac/relayState/_csrf from window._IDK
+        $fields = $login['fields'];
+        $fields['email'] = $user;
+        $identifierUrl = $this->ResolveUrl($signin['url'], (string)$login['action']);
+        $auth = $this->PortalRequest($ch, 'POST', $identifierUrl, ['Referer: ' . $signin['url']], $fields);
+        $this->SendDebug('PortalLogin', 'E-Mail-Schritt: HTTP ' . $auth['code'] . ', ' . $this->UrlWithoutQuery($auth['url']), 0);
+        if ($auth['error'] !== '' || $auth['code'] >= 400) {
+            throw new Exception('Anmeldung: E-Mail-Schritt fehlgeschlagen (HTTP ' . $auth['code'] . ') ' . $auth['error'], 203);
         }
 
-        $idk = $this->ParseIdk($res['body']);
-        if ($idk === null) {
-            throw new Exception('Anmeldung: Passwort-Seite nicht erkannt - Login-Seite von VW geändert?', 203);
+        // password / authenticate step: posted to the form action of the password page
+        $step = $this->LoginFields($auth['body']);
+        if (empty($step['fields']['hmac']) || empty($step['fields']['_csrf'])) {
+            $error = $this->LoginErrorText($step['model']);
+            throw new Exception('Anmeldung: keine Passwort-Seite erhalten - ' . ($error !== '' ? $this->DescribeLoginError($error) . ' (' . $error . ')' : 'E-Mail-Adresse prüfen') . '.', 203);
         }
-        $model = is_array($idk['templateModel'] ?? null) ? $idk['templateModel'] : [];
-        if (!empty($model['error'])) {
-            throw new Exception('Anmeldung abgelehnt: ' . (string)$model['error'], 203);
-        }
-        $identifierUrl = (string)($model['identifierUrl'] ?? '');
-        $postAction = (string)($model['postAction'] ?? '');
-        if ($identifierUrl === '' || $postAction === '' || strpos($uri, $identifierUrl) === false) {
-            throw new Exception('Anmeldung: Passwort-Formular unvollständig - Login-Seite von VW geändert?', 203);
-        }
+        $fields = $step['fields'];
+        $fields['email'] = $user;
+        $fields['password'] = $password;
+        $authenticateUrl = (string)$step['action'] !== '' ? $this->ResolveUrl($auth['url'], (string)$step['action']) : $this->UrlWithoutQuery($auth['url']);
+        $template = is_string($step['model']['template'] ?? null) ? $step['model']['template'] : '?';
+        $this->SendDebug('PortalLogin', 'Passwort-Schritt (' . $template . '): ' . $this->UrlWithoutQuery($authenticateUrl), 0);
 
-        // password / authenticate step, the redirect chain leads back to the portal
-        $uri = str_replace($identifierUrl, $postAction, $uri);
-        $res = $this->PortalRequest($ch, 'POST', $uri, [], [
-            '_csrf'      => (string)($idk['csrf_token'] ?? ''),
-            'relayState' => (string)($model['relayState'] ?? ''),
-            'hmac'       => (string)($model['hmac'] ?? ''),
-            'email'      => $user,
-            'password'   => $password
-        ]);
-        if ($res['error'] !== '' || $res['code'] >= 400) {
-            throw new Exception('Anmeldung: Passwort-Schritt fehlgeschlagen (HTTP ' . $res['code'] . ') ' . $res['error'], 203);
+        $landing = $this->PortalRequest($ch, 'POST', $authenticateUrl, ['Referer: ' . $auth['url']], $fields);
+        if ($landing['error'] !== '' || $landing['code'] >= 400) {
+            $error = $this->LoginErrorText($this->ExtractTemplateModel($landing['body']) ?? []);
+            throw new Exception('Anmeldung abgelehnt (HTTP ' . $landing['code'] . ')' . ($error !== '' ? ': ' . $this->DescribeLoginError($error) : '') . ' ' . $landing['error'], 203);
         }
-        return $res;
+        return $landing;
     }
 
     /**
@@ -513,19 +513,114 @@ class VWEUDataActTelemetry extends IPSModule
     }
 
     /**
-     * Action and input values of the form with the given id, or null if absent.
+     * VW periodically interjects an optional marketing consent page after an otherwise
+     * successful login. It is skipped without consenting by following its callback.
      */
-    private function ParseHtmlForm(string $html, string $id): ?array
+    private function SkipMarketingConsent($ch, array $res): array
+    {
+        if (strpos((string)parse_url($res['url'], PHP_URL_PATH), '/consent/marketing/') !== false) {
+            parse_str((string)parse_url($res['url'], PHP_URL_QUERY), $query);
+            $callback = is_string($query['callback'] ?? null) ? $query['callback'] : '';
+        } else {
+            $model = $this->ExtractTemplateModel($res['body']);
+            if (($model['template'] ?? '') !== 'marketConsent') {
+                return $res;
+            }
+            $callback = is_string($model['callback'] ?? null) ? $model['callback'] : '';
+        }
+        if ($callback === '') {
+            throw new Exception('Marketing-Einwilligung ohne Callback-URL - bitte einmal im Browser im Portal anmelden.', 203);
+        }
+
+        $this->SendDebug('PortalLogin', 'Überspringe Marketing-Einwilligung (ohne Zustimmung).', 0);
+        return $this->PortalRequest($ch, 'GET', $this->NormalizeUrlQuery($this->ResolveUrl($res['url'], $callback)), ['Referer: ' . $res['url']]);
+    }
+
+    /**
+     * Login form of an identity page: form action and inputs, with hmac/relayState taken
+     * from window._IDK.templateModel and _csrf from csrf_token when present.
+     */
+    private function LoginFields(string $html): array
+    {
+        $form = $this->ParseHtmlForm($html, 'emailPasswordForm') ?? $this->ParseHtmlForm($html, null);
+        $fields = $form['inputs'] ?? [];
+        $model = $this->ExtractTemplateModel($html) ?? [];
+
+        foreach (['hmac', 'relayState'] as $name) {
+            if (is_string($model[$name] ?? null) && $model[$name] !== '') {
+                $fields[$name] = $model[$name];
+            }
+        }
+        if (($fields['_csrf'] ?? '') === '') {
+            $csrf = $this->ExtractCsrf($html);
+            if ($csrf !== null) {
+                $fields['_csrf'] = $csrf;
+            }
+        }
+
+        return ['action' => $form['action'] ?? null, 'fields' => $fields, 'model' => $model];
+    }
+
+    private function LoginErrorText(array $model): string
+    {
+        $error = $model['error'] ?? null;
+        if (empty($error)) {
+            $error = $model['errorCode'] ?? null;
+        }
+        if (empty($error)) {
+            return '';
+        }
+        if (is_array($error)) {
+            $text = $error['text'] ?? $error['errorCode'] ?? null;
+            return is_scalar($text) ? (string)$text : (string)json_encode($error);
+        }
+        return is_scalar($error) ? (string)$error : '';
+    }
+
+    /**
+     * Readable text for the error codes the identity service reports.
+     */
+    private function DescribeLoginError(string $code): string
+    {
+        if (preg_match('/password_invalid/i', $code)) {
+            return 'Passwort falsch';
+        }
+        if (preg_match('/email_invalid|user_id|identifier/i', $code)) {
+            return 'E-Mail-Adresse bei VW nicht bekannt';
+        }
+        if (preg_match('/throttle|rate_limit|too_many/i', $code)) {
+            return 'zu viele Fehlversuche, VW sperrt das Konto vorübergehend - ca. 30 Minuten warten';
+        }
+        if (preg_match('/account_disabled|locked|blocked/i', $code)) {
+            return 'VW-Konto gesperrt oder deaktiviert';
+        }
+        if (preg_match('/tenants?\.?notAuthorized|client_not_allowed/i', $code)) {
+            return 'Konto ist nicht für das EU-Data-Act-Portal freigeschaltet - Ersteinrichtung im Browser abschließen';
+        }
+        return $code;
+    }
+
+    /**
+     * Action and input values of the form with the given id (null: first form with an
+     * action), or null if absent.
+     */
+    private function ParseHtmlForm(string $html, ?string $id): ?array
     {
         if (!preg_match_all('/<form\b[^>]*>.*?<\/form>/is', $html, $forms)) {
             return null;
         }
         foreach ($forms[0] as $form) {
-            if (!preg_match('/^<form\b[^>]*>/i', $form, $open) || $this->HtmlAttr($open[0], 'id') !== $id) {
+            if (!preg_match('/^<form\b[^>]*>/i', $form, $open)) {
+                continue;
+            }
+            if ($id !== null && $this->HtmlAttr($open[0], 'id') !== $id) {
                 continue;
             }
             $action = $this->HtmlAttr($open[0], 'action');
             if ($action === null) {
+                if ($id === null) {
+                    continue;
+                }
                 return null;
             }
             $inputs = [];
@@ -558,19 +653,106 @@ class VWEUDataActTelemetry extends IPSModule
     }
 
     /**
-     * Decodes the "window._IDK = {...}" object of the identity password page.
+     * Decodes window._IDK.templateModel, which the identity pages embed as plain JSON.
      */
-    private function ParseIdk(string $html): ?array
+    private function ExtractTemplateModel(string $html): ?array
     {
-        if (!preg_match('/window\._IDK\s*=\s*(.*?)[;<]/s', $html, $m)) {
+        $from = strpos($html, 'window._IDK');
+        $idx = strpos($html, 'templateModel', $from === false ? 0 : $from);
+        if ($idx === false) {
             return null;
         }
-        $json = str_replace("'", '"', $m[1]);
-        $json = (string)preg_replace('/\s(\w+):/', ' "$1":', $json);
-        $json = (string)preg_replace('/,\s+}/s', '}', $json);
+        $start = strpos($html, '{', $idx);
+        if ($start === false) {
+            return null;
+        }
+        $end = $this->MatchBrace($html, $start);
+        if ($end < 0) {
+            return null;
+        }
+        $model = json_decode(substr($html, $start, $end - $start + 1), true);
+        return is_array($model) ? $model : null;
+    }
 
-        $res = json_decode($json, true);
-        return is_array($res) ? $res : null;
+    /**
+     * Position of the brace closing the object that opens at $start; braces inside string
+     * literals are ignored. Returns -1 if unbalanced.
+     */
+    private function MatchBrace(string $text, int $start): int
+    {
+        $depth = 0;
+        $quote = '';
+        $length = strlen($text);
+        for ($i = $start; $i < $length; $i++) {
+            $c = $text[$i];
+            if ($quote !== '') {
+                if ($c === '\\') {
+                    $i++;
+                } elseif ($c === $quote) {
+                    $quote = '';
+                }
+                continue;
+            }
+            if ($c === '"' || $c === "'") {
+                $quote = $c;
+            } elseif ($c === '{') {
+                $depth++;
+            } elseif ($c === '}') {
+                $depth--;
+                if ($depth === 0) {
+                    return $i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private function ExtractCsrf(string $html): ?string
+    {
+        return preg_match('/csrf_token\s*[:=]\s*[\'"]([^\'"]+)[\'"]/', $html, $m) ? $m[1] : null;
+    }
+
+    /**
+     * Resolves a (possibly relative) form action or link against the page url.
+     */
+    private function ResolveUrl(string $base, string $ref): string
+    {
+        if ($ref === '') {
+            return $base;
+        }
+        if (preg_match('#^https?://#i', $ref)) {
+            return $ref;
+        }
+        $parts = parse_url($base);
+        $scheme = is_array($parts) ? ($parts['scheme'] ?? 'https') : 'https';
+        if (strncmp($ref, '//', 2) === 0) {
+            return $scheme . ':' . $ref;
+        }
+        $origin = $scheme . '://' . ($parts['host'] ?? '') . (isset($parts['port']) ? ':' . $parts['port'] : '');
+        $path = $parts['path'] ?? '/';
+        if ($ref[0] === '?') {
+            return $origin . $path . $ref;
+        }
+
+        $query = '';
+        $q = strpos($ref, '?');
+        if ($q !== false) {
+            $query = substr($ref, $q);
+            $ref = substr($ref, 0, $q);
+        }
+        $joined = $ref[0] === '/' ? $ref : substr($path, 0, (int)strrpos($path, '/') + 1) . $ref;
+
+        $segments = [];
+        foreach (explode('/', $joined) as $segment) {
+            if ($segment === '..') {
+                if (count($segments) > 1) {
+                    array_pop($segments);
+                }
+            } elseif ($segment !== '.') {
+                $segments[] = $segment;
+            }
+        }
+        return $origin . implode('/', $segments) . $query;
     }
 
     /**
@@ -585,6 +767,14 @@ class VWEUDataActTelemetry extends IPSModule
         parse_str($parts['query'], $query);
         return ($parts['scheme'] ?? 'https') . '://' . ($parts['host'] ?? '') . (isset($parts['port']) ? ':' . $parts['port'] : '')
             . ($parts['path'] ?? '') . '?' . http_build_query($query);
+    }
+
+    /**
+     * Url for log output: the query carries session tokens and is dropped.
+     */
+    private function UrlWithoutQuery(string $url): string
+    {
+        return explode('?', $url, 2)[0];
     }
 
     private function RandomString(int $length): string
@@ -676,6 +866,13 @@ class VWEUDataActTelemetry extends IPSModule
     {
         $sourceMode = $this->ReadPropertyString('SourceMode');
         if ($sourceMode === 'api') {
+            // After a failed login the timer pauses, so repeated attempts cannot get the VW
+            // account locked. The button (DownloadAndImport) always tries immediately.
+            $failedAt = $this->ReadAttributeInteger('LoginFailedAt');
+            if ($failedAt > 0 && time() - $failedAt < self::LOGIN_RETRY_DELAY) {
+                $this->SendDebug('UpdateData', 'Automatischer Abruf pausiert nach fehlgeschlagener Anmeldung bis ' . date('H:i', $failedAt + self::LOGIN_RETRY_DELAY) . ' Uhr (Schutz vor Kontosperre).', 0);
+                return;
+            }
             $this->DownloadAndImport();
             return;
         }
