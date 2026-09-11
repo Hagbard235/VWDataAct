@@ -408,14 +408,14 @@ class VWEUDataActTelemetry extends IPSModule
             'nonce'         => $this->RandomString(43)
         ]);
         $signin = $this->PortalRequest($ch, 'GET', self::IDENTITY_BASE . '/oidc/v1/authorize?' . $authorizeQuery);
-        $this->SendDebug('PortalLogin', 'Login-Seite: HTTP ' . $signin['code'] . ', ' . $this->UrlWithoutQuery($signin['url']), 0);
+        $this->SendDebug('PortalLogin', 'Login-Seite (Marke ' . $brandState . '): HTTP ' . $signin['code'] . ', ' . $this->UrlWithoutQuery($signin['url']), 0);
         if ($signin['error'] !== '' || $signin['code'] !== 200) {
             throw new Exception('Login-Seite nicht erreichbar (HTTP ' . $signin['code'] . ') ' . $signin['error'], 203);
         }
 
         $login = $this->LoginFields($signin['body']);
         if (!empty($login['fields']['hmac']) && !empty($login['fields']['_csrf'])) {
-            $landing = $this->PortalLoginLegacy($ch, $signin, $login, $session['user'], $session['password']);
+            $landing = $this->PortalLoginLegacy($ch, $signin, $login, $session['user'], $session['password'], $brandState);
         } else {
             $this->SendDebug('PortalLogin', 'Kein E-Mail/Passwort-Formular (hmac/_csrf fehlen) - versuche neuen Login-Ablauf.', 0);
             $landing = $this->PortalLoginNew($ch, $signin['body'], $session['user'], $session['password']);
@@ -426,6 +426,11 @@ class VWEUDataActTelemetry extends IPSModule
         $final = $landing['url'];
         $path = (string)parse_url($final, PHP_URL_PATH);
         $this->SendDebug('PortalLogin', 'Zielseite: HTTP ' . $landing['code'] . ', ' . $this->UrlWithoutQuery($final), 0);
+
+        // terms of use that were updated or never accepted for this brand
+        if (stripos($path, '/terms-and-conditions') !== false) {
+            throw new Exception('Anmeldung angehalten: VW verlangt die Bestätigung der Nutzungsbedingungen (Marke ' . $brandState . '). Bitte einmal im Browser auf ' . self::PORTAL_BASE . ' mit dieser Marke anmelden und bestätigen.', 203);
+        }
 
         // consent screen: the password was correct, but the portal was never authorised in a browser
         if (stripos($path, '/signin-service/v1/consent/') !== false || stripos($landing['body'], 'consent-screen') !== false) {
@@ -450,7 +455,7 @@ class VWEUDataActTelemetry extends IPSModule
     /**
      * Identity login with separate email and password pages (as ioBroker.vw-connect).
      */
-    private function PortalLoginLegacy($ch, array $signin, array $login, string $user, string $password): array
+    private function PortalLoginLegacy($ch, array $signin, array $login, string $user, string $password, string $brandState): array
     {
         // email / identifier step: form inputs plus hmac/relayState/_csrf from window._IDK
         $fields = $login['fields'];
@@ -468,12 +473,22 @@ class VWEUDataActTelemetry extends IPSModule
             $error = $this->LoginErrorText($step['model']);
             throw new Exception('Anmeldung: keine Passwort-Seite erhalten - ' . ($error !== '' ? $this->DescribeLoginError($error) . ' (' . $error . ')' : 'E-Mail-Adresse prüfen') . '.', 203);
         }
+        $authenticateUrl = (string)$step['action'] !== '' ? $this->ResolveUrl($auth['url'], (string)$step['action']) : $this->UrlWithoutQuery($auth['url']);
+        $template = is_string($step['model']['template'] ?? null) ? $step['model']['template'] : '';
+
+        // Only ever send the password to the login. For an e-mail address VW does not know
+        // for this brand it answers with its registration form instead.
+        if (!$this->IsPasswordPage($template, $auth['url'], $authenticateUrl)) {
+            if ($template === 'registerCredentials' || strpos($this->UrlWithoutQuery($auth['url']), '/register') !== false) {
+                throw new Exception('Anmeldung abgebrochen, Passwort nicht gesendet: VW kennt diese E-Mail-Adresse für die Marke ' . $brandState . ' nicht und bietet eine Registrierung an. Bitte die Marke in der Instanz prüfen (z. B. CUPRA).', 203);
+            }
+            throw new Exception('Anmeldung abgebrochen, Passwort nicht gesendet: unerwartete Seite nach dem E-Mail-Schritt (' . ($template !== '' ? $template : '?') . ', ' . $this->UrlWithoutQuery($auth['url']) . ').', 203);
+        }
+
         $fields = $step['fields'];
         $fields['email'] = $user;
         $fields['password'] = $password;
-        $authenticateUrl = (string)$step['action'] !== '' ? $this->ResolveUrl($auth['url'], (string)$step['action']) : $this->UrlWithoutQuery($auth['url']);
-        $template = is_string($step['model']['template'] ?? null) ? $step['model']['template'] : '?';
-        $this->SendDebug('PortalLogin', 'Passwort-Schritt (' . $template . '): ' . $this->UrlWithoutQuery($authenticateUrl), 0);
+        $this->SendDebug('PortalLogin', 'Passwort-Schritt (' . ($template !== '' ? $template : '?') . '): ' . $this->UrlWithoutQuery($authenticateUrl), 0);
 
         $landing = $this->PortalRequest($ch, 'POST', $authenticateUrl, ['Referer: ' . $auth['url']], $fields);
         if ($landing['error'] !== '' || $landing['code'] >= 400) {
@@ -481,6 +496,19 @@ class VWEUDataActTelemetry extends IPSModule
             throw new Exception('Anmeldung abgelehnt (HTTP ' . $landing['code'] . ')' . ($error !== '' ? ': ' . $this->DescribeLoginError($error) : '') . ' ' . $landing['error'], 203);
         }
         return $landing;
+    }
+
+    /**
+     * True if the page after the e-mail step is the login password page. Without a template
+     * name only a /login/authenticate target outside the registration is accepted.
+     */
+    private function IsPasswordPage(string $template, string $pageUrl, string $targetUrl): bool
+    {
+        if ($template !== '') {
+            return $template === 'loginAuthenticate';
+        }
+        return strpos($this->UrlWithoutQuery($targetUrl), '/login/authenticate') !== false
+            && strpos($this->UrlWithoutQuery($pageUrl), '/register') === false;
     }
 
     /**
